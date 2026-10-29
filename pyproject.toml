@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fastgrpc3-transport"
+version = "0.0.0"
+description = "Spike S4: a tonic (Rust) gRPC server transport for fastgrpc3"
+requires-python = ">=3.12"
+
+[tool.maturin]
+features = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

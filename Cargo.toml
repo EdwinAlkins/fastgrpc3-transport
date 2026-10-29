@@ -1,0 +1,34 @@
+[package]
+name = "fastgrpc3-transport"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike S4: a tonic (Rust) gRPC server transport for fastgrpc3"
+
+[lib]
+name = "fastgrpc3_transport"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytes = "1.12"
+http = "1.5"
+tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "signal"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "server", "router", "codegen"] }
+tower = { version = "0.5", features = ["util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+pyo3 = { version = "0.30", optional = true }
+pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"], optional = true }
+# The version tonic routes with (`Routes` wraps an axum `Router`).
+axum = { version = "0.8", default-features = false }
+
+[features]
+python = ["dep:pyo3", "pyo3/extension-module"]
+# Variant A of the spike (one asyncio wake-up per call), kept for benchmarks only.
+variant-a = ["python", "dep:pyo3-async-runtimes"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[dev-dependencies]
+tonic = { version = "0.14", default-features = false, features = ["transport", "channel", "codegen"] }
