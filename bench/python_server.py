@@ -1,14 +1,15 @@
-"""The bench's echo service on the tonic transport, with Python handlers.
+"""The bench's services on the tonic transport, with Python handlers.
 
     python bench/python_server.py direct|queue PORT [TOKIO_THREADS]
 
-Each call does what fastgrpc3's fast path does on `grpc.aio`: decode and validate the
-request (`MessageCodec`), await the handler, encode the response.
+`bench.v1.Bench/{Small,Medium,Large}` echo their request; each call does what fastgrpc3's
+fast path does on `grpc.aio`: decode and validate the request (`MessageCodec`), await the
+handler, encode the response. In `queue` mode, `bench.v1.Streams/Down` streams `id` medium
+messages back for a `Small(id=...)` request, as `fastgrpc/benches/stream_bench.py` does.
 """
 
 import asyncio
 import signal
-import socket
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -17,10 +18,12 @@ from typing import Any
 FASTGRPC = Path(__file__).resolve().parents[2] / "fastgrpc"
 sys.path.insert(0, str(FASTGRPC / "benches"))
 
+from bridge import Bridge, streaming  # noqa: E402
+from contract import make_models, sample  # noqa: E402
 from e2e_servers import fastgrpc3_app  # noqa: E402
 from fastgrpc3_transport import Call, Server  # noqa: E402
 
-from fastgrpc3 import Schema  # noqa: E402
+from fastgrpc3 import Schema, SchemaRegistry  # noqa: E402
 
 Handle = Callable[[bytes], Awaitable[bytes]]
 
@@ -54,6 +57,8 @@ async def direct(port: int, stop: asyncio.Event, threads: int) -> None:
         return await table[path](body)
 
     server = Server(threads=threads)
+    for path in table:
+        server.add_route(path, "unary")
     server.start_direct(handler, asyncio.get_running_loop(), port)
     await stop.wait()
     server.stop()
@@ -61,30 +66,41 @@ async def direct(port: int, stop: asyncio.Event, threads: int) -> None:
 
 async def queue(port: int, stop: asyncio.Event, threads: int) -> None:
     table = routes()
-    loop = asyncio.get_running_loop()
-    server = Server(threads=threads)
-    _, fd = server.start_queue(port)
-    wake = socket.socket(fileno=fd)
-
-    async def run(call: Call) -> None:
-        try:
-            call.reply(await table[call.path](call.body))
-        except Exception as e:  # noqa: BLE001 - the spike answers INTERNAL
-            call.fail(13, str(e))
-
-    def pump() -> None:
-        try:
-            while wake.recv(4096):
-                pass
-        except BlockingIOError:
-            pass
-        for call in server.take():
-            loop.create_task(run(call))
-
-    loop.add_reader(fd, pump)
+    handlers: dict[str, Callable[[Call], Awaitable[None]]] = {}
+    for path, handle in table.items():
+        handlers[path] = _unary(handle)
+    bridge = Bridge(Server(threads=threads), handlers)
+    handlers["/bench.v1.Streams/Down"] = _down(bridge)
+    bridge.start(port)
     await stop.wait()
-    loop.remove_reader(fd)
-    server.stop()
+    bridge.stop()
+
+
+def _unary(handle: Handle) -> Callable[[Call], Awaitable[None]]:
+    async def run(call: Call) -> None:
+        call.reply(await handle(call.body))
+
+    return run
+
+
+def _down(bridge: Bridge) -> Callable[[Call], Awaitable[None]]:
+    """`Small(id=n)` -> n medium messages, encoded one by one as fastgrpc3 does."""
+    models = make_models()
+    registry = SchemaRegistry(default_package="bench.v1")
+    registry.add_model(models.small)
+    registry.add_model(models.medium)
+    schema = Schema.from_registry(registry)
+    small, medium = schema.codec(models.small), schema.codec(models.medium)
+    template = sample(models, "medium")
+
+    @streaming
+    async def down(call: Call) -> None:
+        for _ in range(small.decode(call.body).id):  # type: ignore[attr-defined]
+            if not await bridge.send(call, medium.encode(template)):
+                return  # the client is gone
+        call.finish()
+
+    return down
 
 
 def main() -> None:

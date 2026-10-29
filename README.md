@@ -10,15 +10,19 @@ variant B bridge serves **27,326 / 32,406 requests/s at concurrency 16 / 64**, a
 4,163 / 4,096 for fastgrpc3 on `grpc.aio`: 6.6× / 7.9×, with p50 at c=64 down from 15.3 ms
 to 1.6 ms. On two cores, one process does 5.4× / 6.2× `fastgrpc3 run --workers 2`.
 
+**Lot 1, server streams** (`bench/results/2026-10-30-streams.md`): 200,000 medium messages
+in 3.92 s (51,020 msg/s) against 6.96 s on `grpc.aio`, server memory flat; a reader that
+stops makes the producer stop, a client that cancels ends the handler.
+
 ## Layout
 
 | Path | What |
 |------|------|
 | `src/echo.rs`, `src/bin/echo.rs` | a pure-Rust server answering every unary call with its request bytes: the transport's ceiling |
-| `src/python.rs` | the PyO3 extension `fastgrpc3_transport`: `Server.start_queue` (variant B, see `docs/ARCHITECTURE.md`), `Call.reply` / `Call.fail`; `Server.start_direct` (variant A) behind the `variant-a` feature, for benchmarks |
+| `src/python.rs` | the PyO3 extension `fastgrpc3_transport`: `Server.add_route` / `start_queue` (variant B, see `docs/ARCHITECTURE.md`), `Call.reply`, `try_send` / `when_writable` / `finish` for server streams, `fail`; `Server.start_direct` (variant A) behind the `variant-a` feature, for benchmarks |
 | `tests/echo.rs` | the echo server through a real tonic client (`cargo test`) |
 | `tests/python/` | the variant B bridge through a real `grpc.aio` client (`pytest`) |
-| `bench/` | the S4 benchmark (`s4_bench.py`), its Python servers, and the results |
+| `bench/` | the S4 benchmark (`s4_bench.py`), the stream benchmark (`stream_bench.py`), the asyncio side of variant B (`bridge.py`), the Python servers, and the results |
 | `KNOWN_ISSUES.md` | what the prototype does not do yet, and the lot of the plan that fixes it |
 
 ## Build and test

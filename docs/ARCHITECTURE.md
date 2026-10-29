@@ -38,8 +38,29 @@ How a unary call travels between tokio (Rust, no GIL) and asyncio (Python), as b
 - **Copies**: the request body is copied once into a Python `bytes` (`take()`), the
   response once back into `Bytes` (`reply()`).
 
+## Server streams (lot 1)
+
+```text
+ Python handler                      tokio / tonic                       client
+ bridge.send(call, data)
+   call.try_send(data) ── SENT ───► mpsc (bounded, stream_capacity) ─► HTTP/2 ─► reads
+                       ── FULL ──┐   tonic pulls a message only when HTTP/2 can send it
+   await waiter ◄─ pump ◄─ queue ◄─ Writable(id) ◄─ task: sender.reserve().await
+                       ── CLOSED ─► the client is gone: the handler stops
+ call.finish() / call.fail(code, message)
+```
+
+- The handler never blocks the loop: `try_send` is synchronous; when the channel is full,
+  `when_writable()` spawns a tokio task that waits for room, then pushes a `Writable(id)`
+  event into the same queue as new calls, so the same batched wake-up resumes the handler.
+- Backpressure goes from the client's HTTP/2 window back to the handler: a reader that
+  stops makes the producer stop (bounded by the channel, tonic's and HTTP/2's buffers).
+- `fail()` on a stream sends the status after the messages already queued (a tokio task
+  waits for room); `finish()` drops the sender, which ends the stream with `OK`.
+- A route unknown to the table answers `UNIMPLEMENTED` in Rust, before any Python.
+
 ## Not there yet
 
 The prototype's limits are listed in `KNOWN_ISSUES.md`; the plan to remove them is lot 2
-(bounded queue and admission, fair pump, terminal states, graceful stop), lot 1 (streams)
-and lot 5 (cancellation and deadlines) of the design note.
+(bounded queue and admission, fair pump, terminal states, graceful stop), lot 4 (client
+and bidirectional streams) and lot 5 (cancellation and deadlines) of the design note.
