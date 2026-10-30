@@ -21,9 +21,10 @@ fastgrpc3 run myapp.main:app --transport tonic
 
 or `FASTGRPC_TRANSPORT=tonic`, or `GrpcApp(..., transport="tonic")`.
 
-On one core, fastgrpc3 serves a unary echo 6 to 10 times faster on tonic than on
-`grpc.aio` under concurrency (16 to 64 clients), about 2 times faster with one client
-(`bench/results/2026-10-30-lot8.md`).
+On one core, fastgrpc3 serves a unary echo 8 to 14 times faster on tonic than on
+`grpc.aio` under concurrency (16 to 64 clients; 62,000 calls/s on small messages), with up
+to 17 times less CPU per call, and about 2 times faster with one client
+(`bench/results/2026-10-30-lot9.md`).
 
 ## Layout
 
