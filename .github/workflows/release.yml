@@ -3,11 +3,11 @@ name: Release
 # Wheels for every supported platform and Python, each installed without compiling and
 # tested with fastgrpc3's suite on the tonic transport. On a `v*` tag, the same wheels go to
 # PyPI (trusted publishing, environment `pypi`) and to a GitHub release.
+# Long (macOS runners, PGO): only on a tag, or by hand (Actions > Release > Run workflow)
+# before tagging or after a platform-specific change. ci.yml covers every push.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
 
 jobs:
