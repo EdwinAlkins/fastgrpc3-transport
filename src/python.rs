@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -53,6 +53,9 @@ type Answer = Result<Bytes, Status>;
 type UnaryAnswer = Result<tonic::Response<Bytes>, Status>;
 type StreamFuture = BoxFuture<Result<tonic::Response<Responses>, Status>>;
 type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
+/// Events after which tokio wakes Python without waiting to sleep first.
+const WAKE_AT: usize = 64;
 
 /// `try_send` results.
 const SENT: u8 = 0;
@@ -141,6 +144,9 @@ enum Event {
 /// Events waiting for Python, and the socket that wakes the loop.
 struct Queue {
     events: Mutex<VecDeque<Event>>,
+    /// Events wait that Python has not been woken for. Set and cleared under `events`'
+    /// lock, with the queue it describes.
+    wake_due: AtomicBool,
     waker: wake::Waker,
     next_id: AtomicU64,
     /// Messages a server stream may have queued for tonic before `try_send` says `FULL`.
@@ -233,13 +239,27 @@ impl Queue {
         }
     }
 
+    /// Queue an event for Python. From tokio, the wake-up waits until tokio is about to
+    /// sleep (`on_thread_park`) or `WAKE_AT` events wait: woken at the first event, Python
+    /// preempted tokio on a shared core and took the calls one or two at a time. From
+    /// another thread (Python's own notices), at once: tokio may be asleep.
     fn push(&self, event: Event) {
-        let was_empty = {
+        let waiting = {
             let mut events = self.events.lock().expect("queue");
             events.push_back(event);
-            events.len() == 1
+            if events.len() == 1 {
+                self.wake_due.store(true, Ordering::Relaxed);
+            }
+            events.len()
         };
-        if was_empty {
+        if waiting >= WAKE_AT || tokio::runtime::Handle::try_current().is_err() {
+            self.wake();
+        }
+    }
+
+    /// Wake the loop if events wait unannounced.
+    fn wake(&self) {
+        if self.wake_due.swap(false, Ordering::AcqRel) {
             // Full socket buffer: the loop has wake-ups pending anyway.
             let _ = (&self.waker).write(&[1]);
         }
@@ -790,6 +810,34 @@ impl Drop for Call {
 }
 
 impl Call {
+    /// The answer to send for `data`, or `None`: already answered, or too large (then
+    /// failed with `RESOURCE_EXHAUSTED`).
+    fn unary_answer(&mut self, data: &[u8]) -> PyResult<Option<Delivery>> {
+        if let Err(status) = self.queue.settings.check_send(data.len()) {
+            self.fail(status.code() as i32, status.message(), None);
+            return Ok(None);
+        }
+        match self.reply.take() {
+            Some(Reply::Unary(sender)) => {
+                let mut extensions = http::Extensions::new();
+                if !self.trailers.is_empty() {
+                    extensions.insert(Trailers(std::mem::take(&mut self.trailers)));
+                }
+                let initial = std::mem::take(&mut self.initial);
+                let data = Bytes::copy_from_slice(data);
+                let response = tonic::Response::from_parts(initial, data, extensions);
+                Ok(Some((sender, Ok(response))))
+            }
+            Some(stream @ Reply::Stream(..)) => {
+                self.reply = Some(stream);
+                Err(PyValueError::new_err(
+                    "reply() is for unary calls: use try_send",
+                ))
+            }
+            None => Ok(None), // already answered: the first answer stands
+        }
+    }
+
     /// Let a response stream send its headers (the initial metadata, if any).
     fn release_headers(&mut self) {
         self.headers_sent = true;
@@ -904,31 +952,12 @@ impl Call {
         }
     }
 
-    /// Answer a unary call with the response bytes.
+    /// Answer a unary call with the response bytes (`Server.reply_many` for several).
     fn reply(&mut self, data: &[u8]) -> PyResult<()> {
-        if let Err(status) = self.queue.settings.check_send(data.len()) {
-            self.fail(status.code() as i32, status.message(), None);
-            return Ok(());
+        if let Some((sender, answer)) = self.unary_answer(data)? {
+            let _ = sender.send(answer);
         }
-        match self.reply.take() {
-            Some(Reply::Unary(sender)) => {
-                let mut extensions = http::Extensions::new();
-                if !self.trailers.is_empty() {
-                    extensions.insert(Trailers(std::mem::take(&mut self.trailers)));
-                }
-                let initial = std::mem::take(&mut self.initial);
-                let data = Bytes::copy_from_slice(data);
-                let _ = sender.send(Ok(tonic::Response::from_parts(initial, data, extensions)));
-                Ok(())
-            }
-            Some(stream @ Reply::Stream(..)) => {
-                self.reply = Some(stream);
-                Err(PyValueError::new_err(
-                    "reply() is for unary calls: use try_send",
-                ))
-            }
-            None => Ok(()), // already answered: the first answer stands
-        }
+        Ok(())
     }
 
     /// Queue one message of a server stream: `0` sent, `1` full (call `when_writable`,
@@ -1180,6 +1209,7 @@ impl Server {
         let (waker, python_end) = wake::pair()?;
         let queue = Arc::new(Queue {
             events: Mutex::new(VecDeque::new()),
+            wake_due: AtomicBool::new(false),
             waker,
             next_id: AtomicU64::new(1),
             stream_capacity: self.stream_capacity,
@@ -1206,7 +1236,11 @@ impl Server {
         let (events, more): (Vec<Event>, bool) = {
             let mut waiting = queue.events.lock().expect("queue");
             let count = waiting.len().min(max_events.max(1));
-            (waiting.drain(..count).collect(), !waiting.is_empty())
+            let events = waiting.drain(..count).collect();
+            if waiting.is_empty() {
+                queue.wake_due.store(false, Ordering::Relaxed); // all of them seen
+            }
+            (events, !waiting.is_empty())
         };
         let (mut calls, mut writable, mut requests) = (Vec::new(), Vec::new(), Vec::new());
         let mut cancelled = Vec::new();
@@ -1236,6 +1270,28 @@ impl Server {
             }
         }
         Ok((calls, writable, requests, cancelled, more))
+    }
+
+    /// Answer several unary calls at once, `[(call, bytes), ...]`: tokio is woken once for
+    /// all of them (each `Call.reply` from Python wakes it, a system call every time).
+    fn reply_many(&self, answers: Vec<(Bound<'_, Call>, Bound<'_, PyBytes>)>) -> PyResult<()> {
+        let Some(runtime) = &self.runtime else {
+            return Err(PyRuntimeError::new_err("the server is not started"));
+        };
+        let mut deliveries = Vec::with_capacity(answers.len());
+        for (call, data) in &answers {
+            if let Some(delivery) = call.borrow_mut().unary_answer(data.as_bytes())? {
+                deliveries.push(delivery);
+            }
+        }
+        if !deliveries.is_empty() {
+            runtime.spawn(async move {
+                for (sender, answer) in deliveries {
+                    let _ = sender.send(answer);
+                }
+            });
+        }
+        Ok(())
     }
 
     /// Start stopping, without blocking: refuse new calls, let the calls in flight finish
@@ -1276,6 +1332,9 @@ impl Server {
     }
 }
 
+/// A unary answer and where it goes.
+type Delivery = (oneshot::Sender<UnaryAnswer>, UnaryAnswer);
+
 /// `(cert, key, client_ca, client_required)`, in PEM.
 type TlsFiles = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, bool);
 
@@ -1307,6 +1366,11 @@ impl Server {
                     builder.worker_threads(threads);
                     builder
                 };
+                #[allow(irrefutable_let_patterns)] // the only bridge without variant A
+                if let Bridge::Queue(queue) = &bridge {
+                    let queue = queue.clone();
+                    builder.on_thread_park(move || queue.wake());
+                }
                 let runtime = builder.enable_all().build().expect("tokio runtime");
                 let _ = handle_sender.send(runtime.handle().clone());
                 runtime.block_on(async move {
