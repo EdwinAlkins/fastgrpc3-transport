@@ -290,12 +290,24 @@ impl Queue {
     }
 }
 
-/// The local, monotonic deadline of a call from its `grpc-timeout` header, 1 ms early.
-/// tonic arms its own timer for the same header, and answers `CANCELLED: Timeout expired`
-/// when it fires first; we are called a few microseconds after it (axum calls a route on
-/// its first poll), so without the margin our timer sometimes lands one millisecond tick
-/// later (tokio's resolution). One millisecond early, ours always fires first, and the
-/// client gets `DEADLINE_EXCEEDED`, as from `grpc.aio`.
+/// A call's deadline, stamped on the request by `stamp_deadline` for the router.
+#[derive(Clone, Copy)]
+struct Deadline(Instant);
+
+/// Read the deadline before tonic arms its own timer for the same header: its
+/// `GrpcTimeout` calls the inner service (this layer) just before creating that timer, so
+/// ours is never later, and as tonic polls the call before its timer, the client gets our
+/// `DEADLINE_EXCEEDED` rather than tonic's `CANCELLED: Timeout expired`. The router itself
+/// runs later, on axum's first poll: computed there, the deadline lost the race on slow
+/// machines.
+fn stamp_deadline(mut request: http::Request<Body>) -> http::Request<Body> {
+    if let Some(deadline) = deadline(request.headers()) {
+        request.extensions_mut().insert(Deadline(deadline));
+    }
+    request
+}
+
+/// The local, monotonic deadline of a call from its `grpc-timeout` header.
 fn deadline(headers: &http::HeaderMap) -> Option<Instant> {
     let value = headers.get("grpc-timeout")?.to_str().ok()?;
     let (amount, unit) = value.split_at(value.len().checked_sub(1)?);
@@ -309,9 +321,7 @@ fn deadline(headers: &http::HeaderMap) -> Option<Instant> {
         "n" => Duration::from_nanos(amount),
         _ => return None,
     };
-    Instant::now()
-        .checked_add(timeout)?
-        .checked_sub(Duration::from_millis(1))
+    Instant::now().checked_add(timeout)
 }
 
 /// Tells Python when tonic drops a call before its end (client gone, deadline, closed
@@ -698,7 +708,7 @@ impl tower::Service<http::Request<Body>> for Router {
 
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
         let path = request.uri().path().to_owned();
-        let deadline = deadline(request.headers());
+        let deadline = request.extensions().get::<Deadline>().map(|stamp| stamp.0);
         let (bridge, settings) = (self.bridge.clone(), self.settings);
         match (self.routes.get(&path).copied(), bridge) {
             (Some(kind), Bridge::Queue(queue)) => Box::pin(async move {
@@ -1403,12 +1413,12 @@ impl Server {
                             .http2_keepalive_interval(Some(interval))
                             .http2_keepalive_timeout(Some(timeout));
                     }
-                    let serve =
-                        server
-                            .add_routes(routes)
-                            .serve_with_incoming_shutdown(incoming, async {
-                                let _ = drain.await;
-                            });
+                    let serve = server
+                        .layer(tower::util::MapRequestLayer::new(stamp_deadline))
+                        .add_routes(routes)
+                        .serve_with_incoming_shutdown(incoming, async {
+                            let _ = drain.await;
+                        });
                     tokio::pin!(serve);
                     let grace = tokio::select! {
                         _ = &mut serve => return,
