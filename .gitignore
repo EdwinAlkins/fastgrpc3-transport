@@ -4,3 +4,5 @@ __pycache__/
 /dist
 # Local resume log, not published
 PROGRESS.md
+# PGO profiles (scripts/pgo-prepare.sh)
+/pgo

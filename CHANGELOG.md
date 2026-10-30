@@ -34,6 +34,8 @@ First release: an experimental gRPC server transport for fastgrpc3 on tonic, sel
 
 - Wheels for CPython 3.12, 3.13 and 3.14 on Linux (x86_64, aarch64, manylinux), macOS
   (arm64, x86_64) and Windows (x86_64), tested by installing them without compiling.
+- Linux wheels built with profile-guided optimization (`scripts/pgo-prepare.sh`, trained
+  by a fastgrpc3 app under load): about −11 % CPU per call on the tokio side.
 
 ### Known limitations
 

@@ -37,6 +37,8 @@ jobs:
           manylinux: auto
           # Regular CPython only: no abi3, no free-threaded build (not validated).
           args: --release --out dist -i python3.12 python3.13 python3.14
+          # Linux only (servers): profile-guided optimization, see scripts/pgo-prepare.sh.
+          before-script-linux: source scripts/pgo-prepare.sh python3.14
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.name }}
