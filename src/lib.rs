@@ -3,4 +3,6 @@
 pub mod echo;
 
 #[cfg(feature = "python")]
+mod peer;
+#[cfg(feature = "python")]
 mod python;

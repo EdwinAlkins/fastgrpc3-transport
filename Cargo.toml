@@ -12,8 +12,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bytes = "1.12"
 http = "1.5"
+http-body = "1"
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
-tonic = { version = "0.14", default-features = false, features = ["transport", "server", "router", "codegen"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "server", "router", "codegen", "gzip", "deflate", "tls-ring"] }
+x509-parser = { version = "0.17", optional = true }
+base64 = { version = "0.22", optional = true }
+socket2 = { version = "0.6", features = ["all"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 pyo3 = { version = "0.30", optional = true }
@@ -22,7 +26,7 @@ pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"], optional
 axum = { version = "0.8", default-features = false }
 
 [features]
-python = ["dep:pyo3", "pyo3/extension-module"]
+python = ["dep:pyo3", "pyo3/extension-module", "dep:x509-parser", "dep:base64"]
 # Variant A of the spike (one asyncio wake-up per call), kept for benchmarks only.
 variant-a = ["python", "dep:pyo3-async-runtimes"]
 

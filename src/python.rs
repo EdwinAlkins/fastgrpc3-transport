@@ -13,10 +13,14 @@
 //!   (`pyo3-async-runtimes`), one wake-up per call.
 //!
 //! Routes are declared before starting (`add_route`); any other path is `UNIMPLEMENTED`.
+//! Response headers go out with the answer of a unary call, and with the first message,
+//! `send_initial_metadata` or the end of a stream, as gRPC does; trailing metadata is added
+//! to the status trailers.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::os::fd::IntoRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,16 +36,24 @@ use pyo3::types::{PyBytes, PyString};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::body::Body;
-use tonic::metadata::{KeyAndValueRef, MetadataMap};
+use tonic::codec::CompressionEncoding;
+use tonic::metadata::{
+    AsciiMetadataKey, BinaryMetadataKey, KeyAndValueRef, MetadataMap, MetadataValue,
+};
 use tonic::server::{
     ClientStreamingService, Grpc, ServerStreamingService, StreamingService, UnaryService,
 };
+use tonic::transport::{CertificateDer, ServerTlsConfig};
 use tonic::{Code, Status, Streaming};
 use tower::ServiceExt;
 
 use crate::echo::BytesCodec;
+use crate::peer;
 
 type Answer = Result<Bytes, Status>;
+/// A unary answer: the response and its headers (and `Trailers` in its extensions).
+type UnaryAnswer = Result<tonic::Response<Bytes>, Status>;
+type StreamFuture = BoxFuture<Result<tonic::Response<Responses>, Status>>;
 type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
 /// `try_send` results.
@@ -59,13 +71,45 @@ enum Kind {
 
 /// Where a call's answer goes.
 enum Reply {
-    Unary(oneshot::Sender<Answer>),
-    Stream(mpsc::Sender<Answer>),
+    Unary(oneshot::Sender<UnaryAnswer>),
+    Stream(mpsc::Sender<Answer>, StreamEnds),
+}
+
+/// When a response stream sends its headers, and the trailers of its successful end.
+struct StreamEnds {
+    headers: Option<oneshot::Sender<MetadataMap>>,
+    trailers: Arc<Mutex<Option<MetadataMap>>>,
+}
+
+/// The trailing metadata of a successful unary answer, carried in its extensions.
+#[derive(Clone)]
+struct Trailers(MetadataMap);
+
+/// Who called: the address, and the certificates of an mTLS client.
+#[derive(Default)]
+struct Peer {
+    address: Option<SocketAddr>,
+    certificates: Option<Arc<Vec<CertificateDer<'static>>>>,
+}
+
+impl Peer {
+    fn of<T>(request: &tonic::Request<T>) -> Self {
+        Self {
+            address: request.remote_addr(),
+            certificates: request.peer_certs(),
+        }
+    }
+
+    /// The client's leaf certificate, if it presented one.
+    fn certificate(&self) -> Option<&[u8]> {
+        self.certificates.as_ref()?.first().map(|der| der.as_ref())
+    }
 }
 
 struct Pending {
     id: u64,
     path: String,
+    peer: Peer,
     /// Converted for Python only if it asks (`Call.metadata()`).
     metadata: MetadataMap,
     deadline: Option<Instant>,
@@ -82,13 +126,16 @@ struct Requests {
 }
 
 /// What tokio hands to Python.
+// Not boxed: that would cost an allocation per call; the queue holds few events at once.
+#[allow(clippy::large_enum_variant)]
 enum Event {
     Call(Pending),
     /// The response channel of stream `id` has room again (or was closed).
     Writable(u64),
-    /// A request message of call `id`; `None` once the stream ends, cleanly (`true`) or
-    /// not (`false`: reset by the client, malformed).
-    Request(u64, Option<Bytes>, bool),
+    /// A request message of call `id`; `None` once the stream ends: cleanly (`0`), reset
+    /// by the client or malformed (`CANCELLED`), or with a message over the size limit
+    /// (`RESOURCE_EXHAUSTED`).
+    Request(u64, Option<Bytes>, i32),
     /// tonic dropped call `id` before its end: cancel its handler.
     Cancelled(u64),
 }
@@ -105,6 +152,66 @@ struct Queue {
     admission: Arc<Semaphore>,
     /// How long a call waits for a permit before `RESOURCE_EXHAUSTED` (zero: not at all).
     admission_timeout: Duration,
+    settings: Settings,
+}
+
+/// What fastgrpc3 configures (`Limits`, `Compression`, `Keepalive`, port sharing).
+#[derive(Clone, Copy)]
+struct Settings {
+    max_recv_bytes: Option<usize>,
+    max_send_bytes: Option<usize>,
+    max_metadata_bytes: Option<u32>,
+    compression: Option<CompressionEncoding>,
+    keepalive: Option<(Duration, Duration)>,
+    reuse_port: bool,
+    tls: bool,
+}
+
+impl Settings {
+    /// The codec of one call: requests in gzip or deflate are accepted, as `grpc` does.
+    fn grpc(&self) -> Grpc<BytesCodec> {
+        let mut grpc = Grpc::new(BytesCodec)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Deflate);
+        if let Some(encoding) = self.compression {
+            grpc = grpc.send_compressed(encoding); // if the client accepts it
+        }
+        if let Some(max) = self.max_recv_bytes {
+            grpc = grpc.max_decoding_message_size(max);
+        }
+        grpc
+    }
+
+    /// `grpc`'s status for a message over `max_send_bytes` (tonic checks it too late, with
+    /// `OUT_OF_RANGE`).
+    fn check_send(&self, size: usize) -> Result<(), Status> {
+        match self.max_send_bytes {
+            Some(max) if size > max => Err(Status::resource_exhausted(format!(
+                "Sent message larger than max ({size} vs. {max})"
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// tonic refuses a request over `max_recv_bytes` with `OUT_OF_RANGE`; `grpc` says
+/// `RESOURCE_EXHAUSTED`.
+fn too_large(status: &Status) -> bool {
+    status.code() == Code::OutOfRange && status.message().contains("message length too large")
+}
+
+/// The same, on a response tonic built from such a status (trailers only).
+fn too_large_response(mut response: http::Response<Body>) -> http::Response<Body> {
+    let headers = response.headers_mut();
+    let refused = headers.get("grpc-status").is_some_and(|code| code == "11")
+        && headers
+            .get("grpc-message")
+            .and_then(|message| message.to_str().ok())
+            .is_some_and(|message| message.contains("message%20length%20too%20large"));
+    if refused {
+        headers.insert("grpc-status", http::HeaderValue::from_static("8"));
+    }
+    response
 }
 
 impl Queue {
@@ -144,6 +251,7 @@ impl Queue {
     fn call(
         &self,
         path: String,
+        peer: Peer,
         metadata: MetadataMap,
         deadline: Option<Instant>,
         body: Bytes,
@@ -153,6 +261,7 @@ impl Queue {
         self.push(Event::Call(Pending {
             id,
             path,
+            peer,
             metadata,
             deadline,
             body,
@@ -223,6 +332,7 @@ fn call_streaming(
     request: tonic::Request<Streaming<Bytes>>,
     reply: Reply,
 ) -> u64 {
+    let peer = Peer::of(&request);
     let (metadata, _, requests) = request.into_parts();
     let id = queue.next_id.fetch_add(1, Ordering::Relaxed);
     // No credit until the call is queued: its messages must not overtake it.
@@ -231,6 +341,7 @@ fn call_streaming(
     queue.push(Event::Call(Pending {
         id,
         path,
+        peer,
         metadata,
         deadline,
         body: Bytes::new(),
@@ -250,13 +361,14 @@ async fn feed(queue: Arc<Queue>, id: u64, mut requests: Streaming<Bytes>, credit
             Ok(permit) => permit.forget(),
             Err(_) => return,
         }
-        let (message, ok) = match requests.message().await {
-            Ok(Some(data)) => (Some(data), true),
-            Ok(None) => (None, true),
-            Err(_) => (None, false),
+        let (message, code) = match requests.message().await {
+            Ok(Some(data)) => (Some(data), 0),
+            Ok(None) => (None, 0),
+            Err(status) if too_large(&status) => (None, Code::ResourceExhausted as i32),
+            Err(_) => (None, Code::Cancelled as i32),
         };
         let end = message.is_none();
-        queue.push(Event::Request(id, message, ok));
+        queue.push(Event::Request(id, message, code));
         if end {
             return;
         }
@@ -266,10 +378,10 @@ async fn feed(queue: Arc<Queue>, id: u64, mut requests: Streaming<Bytes>, credit
 /// The handler's answer, or `DEADLINE_EXCEEDED`. The watch stays armed when the answer
 /// does not come (deadline, or tonic dropping this future): the handler is cancelled.
 async fn answer(
-    receiver: oneshot::Receiver<Answer>,
+    receiver: oneshot::Receiver<UnaryAnswer>,
     deadline: Option<Instant>,
     mut watch: Watch,
-) -> Answer {
+) -> UnaryAnswer {
     let received = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline.into(), receiver).await {
             Ok(received) => received,
@@ -306,19 +418,21 @@ impl UnaryService<Bytes> for Unary {
 
     fn call(&mut self, request: tonic::Request<Bytes>) -> Self::Future {
         let (bridge, path, deadline) = (self.bridge.clone(), self.path.clone(), self.deadline);
+        let peer = Peer::of(&request);
         let (metadata, _, body) = request.into_parts();
         Box::pin(async move {
-            let answer = match bridge {
+            match bridge {
                 Bridge::Queue(queue) => {
                     let (sender, receiver) = oneshot::channel();
                     let reply = Reply::Unary(sender);
-                    let id = queue.call(path, metadata, deadline, body, reply);
+                    let id = queue.call(path, peer, metadata, deadline, body, reply);
                     answer(receiver, deadline, Watch::new(queue, id)).await
                 }
                 #[cfg(feature = "variant-a")]
-                Bridge::Direct { handler, locals } => direct(&handler, &locals, path, body).await,
-            };
-            answer.map(tonic::Response::new)
+                Bridge::Direct { handler, locals } => direct(&handler, &locals, path, body)
+                    .await
+                    .map(tonic::Response::new),
+            }
         })
     }
 }
@@ -339,11 +453,7 @@ impl ClientStreamingService<Bytes> for ClientStream {
         let (path, deadline) = (self.path.clone(), self.deadline);
         let id = call_streaming(&self.queue, path, deadline, request, Reply::Unary(sender));
         let watch = Watch::new(self.queue.clone(), id);
-        Box::pin(async move {
-            answer(receiver, deadline, watch)
-                .await
-                .map(tonic::Response::new)
-        })
+        Box::pin(answer(receiver, deadline, watch))
     }
 }
 
@@ -353,16 +463,20 @@ struct ResponseStream {
     path: String,
     deadline: Option<Instant>,
     permit: Option<OwnedSemaphorePermit>,
+    trailers: Arc<Mutex<Option<MetadataMap>>>,
 }
-
-type StreamFuture = std::future::Ready<Result<tonic::Response<Responses>, Status>>;
 
 impl ResponseStream {
     fn respond(&mut self, start: impl FnOnce(Reply) -> u64) -> StreamFuture {
         // Bounded: tonic pulls a message only when HTTP/2 can send it, so a slow client
         // fills this channel and `try_send` tells the handler to wait.
         let (sender, receiver) = mpsc::channel(self.queue.stream_capacity);
-        let id = start(Reply::Stream(sender));
+        let (headers, headers_received) = oneshot::channel();
+        let ends = StreamEnds {
+            headers: Some(headers),
+            trailers: self.trailers.clone(),
+        };
+        let id = start(Reply::Stream(sender, ends));
         let responses = Responses {
             inner: ReceiverStream::new(receiver),
             deadline: self
@@ -372,7 +486,22 @@ impl ResponseStream {
             watch: Watch::new(self.queue.clone(), id),
             _permit: self.permit.take(),
         };
-        std::future::ready(Ok(tonic::Response::new(responses)))
+        let deadline = self.deadline;
+        Box::pin(async move {
+            // Dropped meanwhile (client gone, deadline), `responses` cancels the handler.
+            let headers = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline.into(), headers_received)
+                    .await
+                    .map_err(|_| Status::deadline_exceeded("deadline exceeded"))?,
+                None => headers_received.await,
+            };
+            let headers = headers.unwrap_or_default();
+            Ok(tonic::Response::from_parts(
+                headers,
+                responses,
+                http::Extensions::new(),
+            ))
+        })
     }
 }
 
@@ -383,8 +512,9 @@ impl ServerStreamingService<Bytes> for ResponseStream {
 
     fn call(&mut self, request: tonic::Request<Bytes>) -> Self::Future {
         let (queue, path, deadline) = (self.queue.clone(), self.path.clone(), self.deadline);
+        let peer = Peer::of(&request);
         let (metadata, _, body) = request.into_parts();
-        self.respond(|reply| queue.call(path, metadata, deadline, body, reply))
+        self.respond(|reply| queue.call(path, peer, metadata, deadline, body, reply))
     }
 }
 
@@ -435,6 +565,76 @@ impl tokio_stream::Stream for Responses {
     }
 }
 
+/// A response body whose trailers also carry the handler's trailing metadata.
+struct WithTrailers {
+    inner: Body,
+    extra: Arc<Mutex<Option<MetadataMap>>>,
+}
+
+impl http_body::Body for WithTrailers {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Status>>> {
+        let frame = std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_frame(context));
+        Poll::Ready(frame.map(|frame| {
+            frame.map(|frame| match frame.into_trailers() {
+                Ok(mut trailers) => {
+                    if let Some(extra) = self.extra.lock().expect("trailers").take() {
+                        trailers.extend(extra.into_headers());
+                    }
+                    http_body::Frame::trailers(trailers)
+                }
+                Err(frame) => frame,
+            })
+        }))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn with_trailers(
+    response: http::Response<Body>,
+    extra: Arc<Mutex<Option<MetadataMap>>>,
+) -> http::Response<Body> {
+    response.map(|inner| Body::new(WithTrailers { inner, extra }))
+}
+
+/// A unary answer's `Trailers`, if any, added to its body's trailers.
+fn unary_trailers(mut response: http::Response<Body>) -> http::Response<Body> {
+    match response.extensions_mut().remove::<Trailers>() {
+        Some(Trailers(trailers)) => with_trailers(response, Arc::new(Mutex::new(Some(trailers)))),
+        None => response,
+    }
+}
+
+/// Response metadata from Python's `(key, str | bytes)` pairs (`-bin` keys take bytes).
+fn to_metadata(pairs: Vec<(String, Bound<'_, PyAny>)>) -> PyResult<MetadataMap> {
+    let invalid = |key: &str| PyValueError::new_err(format!("invalid metadata {key:?}"));
+    let mut metadata = MetadataMap::new();
+    for (key, value) in pairs {
+        if key.ends_with("-bin") {
+            let name = BinaryMetadataKey::from_bytes(key.as_bytes()).map_err(|_| invalid(&key))?;
+            let value = MetadataValue::from_bytes(value.cast::<PyBytes>()?.as_bytes());
+            metadata.append_bin(name, value);
+        } else {
+            let name = AsciiMetadataKey::from_bytes(key.as_bytes()).map_err(|_| invalid(&key))?;
+            let value = value.cast::<PyString>()?.to_str()?.parse();
+            metadata.append(name, value.map_err(|_| invalid(&key))?);
+        }
+    }
+    Ok(metadata)
+}
+
 #[cfg(feature = "variant-a")]
 async fn direct(
     handler: &Py<PyAny>,
@@ -462,6 +662,7 @@ async fn direct(
 struct Router {
     bridge: Bridge,
     routes: Arc<HashMap<String, Kind>>,
+    settings: Settings,
 }
 
 impl tower::Service<http::Request<Body>> for Router {
@@ -476,7 +677,7 @@ impl tower::Service<http::Request<Body>> for Router {
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
         let path = request.uri().path().to_owned();
         let deadline = deadline(request.headers());
-        let bridge = self.bridge.clone();
+        let (bridge, settings) = (self.bridge.clone(), self.settings);
         match (self.routes.get(&path).copied(), bridge) {
             (Some(kind), Bridge::Queue(queue)) => Box::pin(async move {
                 // Held until the answer (unary, client stream) or by the responses.
@@ -484,8 +685,8 @@ impl tower::Service<http::Request<Body>> for Router {
                     Ok(permit) => permit,
                     Err(status) => return Ok(status.into_http()),
                 };
-                let mut grpc = Grpc::new(BytesCodec);
-                Ok(match kind {
+                let mut grpc = settings.grpc();
+                Ok(too_large_response(match kind {
                     Kind::Unary => {
                         let _permit = permit;
                         let bridge = Bridge::Queue(queue);
@@ -494,7 +695,7 @@ impl tower::Service<http::Request<Body>> for Router {
                             path,
                             deadline,
                         };
-                        grpc.unary(unary, request).await
+                        unary_trailers(grpc.unary(unary, request).await)
                     }
                     Kind::ClientStream => {
                         let _permit = permit;
@@ -503,22 +704,25 @@ impl tower::Service<http::Request<Body>> for Router {
                             path,
                             deadline,
                         };
-                        grpc.client_streaming(stream, request).await
+                        unary_trailers(grpc.client_streaming(stream, request).await)
                     }
                     Kind::ServerStream | Kind::BidiStream => {
+                        let trailers = Arc::new(Mutex::new(None));
                         let stream = ResponseStream {
                             queue,
                             path,
                             deadline,
                             permit: Some(permit),
+                            trailers: trailers.clone(),
                         };
-                        if kind == Kind::ServerStream {
+                        let response = if kind == Kind::ServerStream {
                             grpc.server_streaming(stream, request).await
                         } else {
                             grpc.streaming(stream, request).await
-                        }
+                        };
+                        with_trailers(response, trailers)
                     }
-                })
+                }))
             }),
             #[cfg(feature = "variant-a")]
             (Some(Kind::Unary), bridge @ Bridge::Direct { .. }) => {
@@ -554,8 +758,13 @@ struct Call {
     path: String,
     #[pyo3(get)]
     body: Py<PyBytes>,
+    peer: Peer,
     metadata: MetadataMap,
     deadline: Option<Instant>,
+    /// Response headers and trailers set by the handler.
+    initial: MetadataMap,
+    trailers: MetadataMap,
+    headers_sent: bool,
     reply: Option<Reply>,
     requests: Option<Requests>,
     queue: Arc<Queue>,
@@ -569,11 +778,23 @@ impl Drop for Call {
         if let Some(requests) = &self.requests {
             requests.feeder.abort();
         }
-        if let Some(Reply::Stream(sender)) = self.reply.take() {
+        if let Some(Reply::Stream(sender, _)) = self.reply.take() {
             let status = Status::internal("the handler did not finish the stream");
             self.runtime.spawn(async move {
                 let _ = sender.send(Err(status)).await;
             });
+        }
+    }
+}
+
+impl Call {
+    /// Let a response stream send its headers (the initial metadata, if any).
+    fn release_headers(&mut self) {
+        self.headers_sent = true;
+        if let Some(Reply::Stream(_, ends)) = &mut self.reply
+            && let Some(headers) = ends.headers.take()
+        {
+            let _ = headers.send(std::mem::take(&mut self.initial));
         }
     }
 }
@@ -583,7 +804,66 @@ impl Call {
     /// Whether the client expects a stream of responses.
     #[getter]
     fn streaming(&self) -> bool {
-        matches!(self.reply, Some(Reply::Stream(_)))
+        matches!(self.reply, Some(Reply::Stream(..)))
+    }
+
+    /// The client's address, as `grpc` writes it: `ipv4:127.0.0.1:5000`, `ipv6:[::1]:5000`.
+    #[getter]
+    fn peer(&self) -> String {
+        match self.peer.address {
+            Some(SocketAddr::V4(address)) => format!("ipv4:{address}"),
+            // `grpc` escapes the brackets.
+            Some(SocketAddr::V6(address)) => {
+                format!("ipv6:%5B{}%5D:{}", address.ip(), address.port())
+            }
+            None => String::new(),
+        }
+    }
+
+    /// The identities of an mTLS client (`grpc`'s: the certificate's subject alternative
+    /// names, or its common name), `None` without a client certificate.
+    fn peer_identities<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyBytes>>> {
+        let identities = peer::identities(self.peer.certificate()?);
+        Some(
+            identities
+                .iter()
+                .map(|identity| PyBytes::new(py, identity))
+                .collect(),
+        )
+    }
+
+    /// `grpc`'s authentication context: empty in plaintext.
+    fn auth_context<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> HashMap<&'static str, Vec<Bound<'py, PyBytes>>> {
+        if !self.queue.settings.tls {
+            return HashMap::new();
+        }
+        let context = peer::auth_context(self.peer.certificate());
+        let bytes = |values: Vec<Vec<u8>>| values.iter().map(|v| PyBytes::new(py, v)).collect();
+        context
+            .into_iter()
+            .map(|(key, values)| (key, bytes(values)))
+            .collect()
+    }
+
+    /// Response headers: sent now by a stream, with the answer by a unary call.
+    fn send_initial_metadata(&mut self, metadata: Vec<(String, Bound<'_, PyAny>)>) -> PyResult<()> {
+        if self.headers_sent {
+            return Err(PyValueError::new_err(
+                "the initial metadata was already sent",
+            ));
+        }
+        self.initial = to_metadata(metadata)?;
+        self.release_headers();
+        Ok(())
+    }
+
+    /// Response trailers, sent with the status (replaces those set before).
+    fn set_trailing_metadata(&mut self, metadata: Vec<(String, Bound<'_, PyAny>)>) -> PyResult<()> {
+        self.trailers = to_metadata(metadata)?;
+        Ok(())
     }
 
     /// The request metadata, as `(key, str | bytes)` pairs (`-bin` keys: bytes), without
@@ -624,12 +904,22 @@ impl Call {
 
     /// Answer a unary call with the response bytes.
     fn reply(&mut self, data: &[u8]) -> PyResult<()> {
+        if let Err(status) = self.queue.settings.check_send(data.len()) {
+            self.fail(status.code() as i32, status.message(), None);
+            return Ok(());
+        }
         match self.reply.take() {
             Some(Reply::Unary(sender)) => {
-                let _ = sender.send(Ok(Bytes::copy_from_slice(data)));
+                let mut extensions = http::Extensions::new();
+                if !self.trailers.is_empty() {
+                    extensions.insert(Trailers(std::mem::take(&mut self.trailers)));
+                }
+                let initial = std::mem::take(&mut self.initial);
+                let data = Bytes::copy_from_slice(data);
+                let _ = sender.send(Ok(tonic::Response::from_parts(initial, data, extensions)));
                 Ok(())
             }
-            Some(stream @ Reply::Stream(_)) => {
+            Some(stream @ Reply::Stream(..)) => {
                 self.reply = Some(stream);
                 Err(PyValueError::new_err(
                     "reply() is for unary calls: use try_send",
@@ -643,7 +933,14 @@ impl Call {
     /// wait for this call's id in `take()`, then try again), `2` closed (the client is
     /// gone: stop producing).
     fn try_send(&mut self, data: &[u8]) -> PyResult<u8> {
-        let Some(Reply::Stream(sender)) = &self.reply else {
+        if !self.headers_sent {
+            self.release_headers();
+        }
+        if let Err(status) = self.queue.settings.check_send(data.len()) {
+            self.fail(status.code() as i32, status.message(), None);
+            return Ok(CLOSED);
+        }
+        let Some(Reply::Stream(sender, _)) = &self.reply else {
             return Ok(CLOSED);
         };
         Ok(match sender.try_send(Ok(Bytes::copy_from_slice(data))) {
@@ -658,7 +955,7 @@ impl Call {
 
     /// Ask for this call's id in a later `take()` once its stream has room (or is closed).
     fn when_writable(&self) {
-        let Some(Reply::Stream(sender)) = &self.reply else {
+        let Some(Reply::Stream(sender, _)) = &self.reply else {
             self.queue.push(Event::Writable(self.id));
             return;
         };
@@ -673,6 +970,12 @@ impl Call {
 
     /// End a server stream successfully.
     fn finish(&mut self) {
+        self.release_headers();
+        if let Some(Reply::Stream(_, ends)) = &self.reply
+            && !self.trailers.is_empty()
+        {
+            *ends.trailers.lock().expect("trailers") = Some(std::mem::take(&mut self.trailers));
+        }
         self.reply = None;
     }
 
@@ -681,15 +984,28 @@ impl Call {
     #[pyo3(signature = (code, message, details = None))]
     fn fail(&mut self, code: i32, message: &str, details: Option<&[u8]>) {
         let code = Code::from_i32(code);
+        let mut metadata = std::mem::take(&mut self.trailers).into_headers();
+        if matches!(self.reply, Some(Reply::Unary(_))) {
+            // A failed unary call answers with trailers only: its headers go there too.
+            metadata.extend(std::mem::take(&mut self.initial).into_headers());
+        } else {
+            self.release_headers();
+        }
+        let metadata = MetadataMap::from_headers(metadata);
         let status = match details {
-            Some(details) => Status::with_details(code, message, Bytes::copy_from_slice(details)),
-            None => Status::new(code, message),
+            Some(details) => Status::with_details_and_metadata(
+                code,
+                message,
+                Bytes::copy_from_slice(details),
+                metadata,
+            ),
+            None => Status::with_metadata(code, message, metadata),
         };
         match self.reply.take() {
             Some(Reply::Unary(sender)) => {
                 let _ = sender.send(Err(status));
             }
-            Some(Reply::Stream(sender)) => {
+            Some(Reply::Stream(sender, _)) => {
                 self.runtime.spawn(async move {
                     let _ = sender.send(Err(status)).await;
                 });
@@ -706,6 +1022,8 @@ struct Server {
     stream_capacity: usize,
     max_concurrent_rpcs: usize,
     admission_timeout: Duration,
+    settings: Settings,
+    tls: Option<ServerTlsConfig>,
     routes: HashMap<String, Kind>,
     queue: Option<Arc<Queue>>,
     runtime: Option<tokio::runtime::Handle>,
@@ -716,31 +1034,101 @@ struct Server {
 
 #[pymethods]
 impl Server {
+    /// `max_*_bytes`: `None` keeps tonic's defaults (4 MiB received, no send limit, 16 KiB
+    /// of headers). `compression`: `"gzip"` or `"deflate"` for the responses, when the
+    /// client accepts it. `keepalive`: `(interval, timeout)` of the HTTP/2 pings, in seconds.
+    /// `reuse_port`: share the port with other processes (`SO_REUSEPORT`). `tls`:
+    /// `(cert, key, client_ca, client_required)` in PEM; with `client_ca`, client certificates
+    /// are verified (required if `client_required`).
     #[new]
     #[pyo3(signature = (
         threads = 1,
         stream_capacity = 16,
         max_concurrent_rpcs = 1024,
         admission_timeout = 0.0,
+        *,
+        max_recv_bytes = None,
+        max_send_bytes = None,
+        max_metadata_bytes = None,
+        compression = None,
+        keepalive = None,
+        reuse_port = false,
+        tls = None,
     ))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments
     fn new(
         threads: usize,
         stream_capacity: usize,
         max_concurrent_rpcs: usize,
         admission_timeout: f64,
+        max_recv_bytes: Option<usize>,
+        max_send_bytes: Option<usize>,
+        max_metadata_bytes: Option<u32>,
+        compression: Option<&str>,
+        keepalive: Option<(f64, f64)>,
+        reuse_port: bool,
+        tls: Option<TlsFiles>,
     ) -> PyResult<Self> {
         if stream_capacity == 0 || max_concurrent_rpcs == 0 {
             return Err(PyValueError::new_err(
                 "stream_capacity and max_concurrent_rpcs must be at least 1",
             ));
         }
-        let admission_timeout = Duration::try_from_secs_f64(admission_timeout)
-            .map_err(|_| PyValueError::new_err("admission_timeout must be a duration >= 0"))?;
+        let duration = |seconds: f64, name: &str| {
+            Duration::try_from_secs_f64(seconds)
+                .map_err(|_| PyValueError::new_err(format!("{name} must be a duration >= 0")))
+        };
+        let admission_timeout = duration(admission_timeout, "admission_timeout")?;
+        let compression = match compression {
+            None => None,
+            Some("gzip") => Some(CompressionEncoding::Gzip),
+            Some("deflate") => Some(CompressionEncoding::Deflate),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown compression {other}"
+                )));
+            }
+        };
+        let keepalive = match keepalive {
+            Some((interval, timeout)) => Some((
+                duration(interval, "keepalive interval")?,
+                duration(timeout, "keepalive timeout")?,
+            )),
+            None => None,
+        };
+        let tls = tls.map(|(cert, key, client_ca, client_required)| {
+            let config = ServerTlsConfig::new()
+                .identity(tonic::transport::Identity::from_pem(cert, key))
+                // `grpc`'s default handshake timeout: a client that stalls is let go.
+                .timeout(Duration::from_secs(120));
+            match client_ca {
+                Some(ca) => config
+                    .client_ca_root(tonic::transport::Certificate::from_pem(ca))
+                    .client_auth_optional(!client_required),
+                None => config,
+            }
+        });
+        if let Some(config) = &tls {
+            // Invalid certificates or keys fail here, not on the server thread.
+            tonic::transport::Server::builder()
+                .tls_config(config.clone())
+                .map_err(|e| PyValueError::new_err(format!("invalid TLS configuration: {e}")))?;
+        }
         Ok(Self {
             threads,
             stream_capacity,
             max_concurrent_rpcs,
             admission_timeout,
+            settings: Settings {
+                max_recv_bytes,
+                max_send_bytes,
+                max_metadata_bytes,
+                compression,
+                keepalive,
+                reuse_port,
+                tls: tls.is_some(),
+            },
+            tls,
             routes: HashMap::new(),
             queue: None,
             runtime: None,
@@ -796,6 +1184,7 @@ impl Server {
             stream_capacity: self.stream_capacity,
             admission: Arc::new(Semaphore::new(self.max_concurrent_rpcs)),
             admission_timeout: self.admission_timeout,
+            settings: self.settings,
         });
         self.queue = Some(queue.clone());
         let bound = self.start(Bridge::Queue(queue), host, port)?;
@@ -803,8 +1192,8 @@ impl Server {
     }
 
     /// At most `max_events` of the waiting events, oldest first: the new calls, the ids of
-    /// the streams writable again, the request messages `(id, bytes, True)` and request
-    /// stream ends `(id, None, clean)`, the ids of the calls tonic gave up (cancel their
+    /// the streams writable again, the request messages `(id, bytes, 0)` and request
+    /// stream ends `(id, None, code)` (`0`: clean), the ids of the calls tonic gave up (cancel their
     /// handler), and whether events remain. When some remain, call
     /// `take` again without waiting for the socket: it is written only when the queue goes
     /// from empty to non-empty. A call's messages always come after the call.
@@ -826,8 +1215,12 @@ impl Server {
                     id: call.id,
                     path: call.path,
                     body: PyBytes::new(py, &call.body).unbind(),
+                    peer: call.peer,
                     metadata: call.metadata,
                     deadline: call.deadline,
+                    initial: MetadataMap::new(),
+                    trailers: MetadataMap::new(),
+                    headers_sent: false,
                     reply: Some(call.reply),
                     requests: call.requests,
                     queue: queue.clone(),
@@ -882,17 +1275,21 @@ impl Server {
     }
 }
 
+/// `(cert, key, client_ca, client_required)`, in PEM.
+type TlsFiles = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, bool);
+
 type Taken = (
     Vec<Call>,
     Vec<u64>,
-    Vec<(u64, Option<Py<PyBytes>>, bool)>,
+    Vec<(u64, Option<Py<PyBytes>>, i32)>,
     Vec<u64>,
     bool,
 );
 
 impl Server {
     fn start(&mut self, bridge: Bridge, host: &str, port: u16) -> PyResult<u16> {
-        let listener = std::net::TcpListener::bind((host, port))?;
+        let (settings, tls) = (self.settings, self.tls.clone());
+        let listener = listen(host, port, settings.reuse_port)?;
         listener.set_nonblocking(true)?;
         let bound = listener.local_addr()?.port();
         let (shutdown, stopped) = oneshot::channel::<Duration>();
@@ -922,17 +1319,31 @@ impl Server {
                             })
                         },
                     );
-                    let service = Router { bridge, routes }.map_request(
-                        |request: http::Request<axum::body::Body>| request.map(Body::new),
-                    );
+                    let service = Router {
+                        bridge,
+                        routes,
+                        settings,
+                    }
+                    .map_request(|request: http::Request<axum::body::Body>| request.map(Body::new));
                     let routes =
                         tonic::service::Routes::from(axum::Router::new().fallback_service(service));
                     let (graceful, drain) = oneshot::channel::<()>();
-                    let serve = tonic::transport::Server::builder()
-                        .add_routes(routes)
-                        .serve_with_incoming_shutdown(incoming, async {
-                            let _ = drain.await;
-                        });
+                    let mut server = tonic::transport::Server::builder()
+                        .http2_max_header_list_size(settings.max_metadata_bytes);
+                    if let Some(tls) = tls {
+                        server = server.tls_config(tls).expect("checked by Server()");
+                    }
+                    if let Some((interval, timeout)) = settings.keepalive {
+                        server = server
+                            .http2_keepalive_interval(Some(interval))
+                            .http2_keepalive_timeout(Some(timeout));
+                    }
+                    let serve =
+                        server
+                            .add_routes(routes)
+                            .serve_with_incoming_shutdown(incoming, async {
+                                let _ = drain.await;
+                            });
                     tokio::pin!(serve);
                     let grace = tokio::select! {
                         _ = &mut serve => return,
@@ -955,6 +1366,26 @@ impl Server {
         self.thread = Some(thread);
         Ok(bound)
     }
+}
+
+/// A listening socket, shared with other processes on the same port if `reuse_port`.
+fn listen(host: &str, port: u16, reuse_port: bool) -> std::io::Result<std::net::TcpListener> {
+    if !reuse_port {
+        return std::net::TcpListener::bind((host, port));
+    }
+    let address = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?
+        .next()
+        .ok_or_else(|| std::io::Error::other(format!("no address for {host}")))?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
 }
 
 #[pymodule]

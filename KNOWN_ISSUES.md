@@ -5,11 +5,16 @@ to `fastgrpc/private/docs/conception/11.1-transport-rust.md` (§17).
 
 | Issue | Effect | Lot |
 |-------|--------|-----|
-| No response metadata (headers, trailers), no peer through the bridge | `Context.send_initial_metadata` / `set_trailing_metadata` raise `NotImplementedError` in fastgrpc3 | 6 |
-| Plaintext only; no compression, keepalive or size limits other than tonic's defaults | fastgrpc3 refuses these settings with `transport="tonic"` (but does not enforce `max_send_bytes`) | 6 |
 | The wake-up uses a Unix socket and `loop.add_reader` | not available on Windows (`ProactorEventLoop`) | 8 |
 
+The differences left with `grpc.aio` on the common features are listed in
+`docs/PARITY.md`.
+
 Fixed:
+
+- Lot 6: response headers and trailers, peer, TLS and mTLS (identities, `auth_context`),
+  gzip/deflate, message and metadata size limits, keepalive, `SO_REUSEPORT`
+  (`docs/PARITY.md`).
 
 - Lot 5: a call tonic gives up before its end (client gone, deadline, closed connection,
   stop) is reported to Python (`take()`'s cancelled ids) and its task cancelled; the
