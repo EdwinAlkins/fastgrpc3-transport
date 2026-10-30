@@ -26,7 +26,7 @@ Plan: §8 and lot 6 of the development plan (not published).
 | `max_metadata_bytes` | HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` (hyper) | by hand | stricter: with a 1 KiB limit, 4 KiB of request metadata passes on `grpc.aio` (soft limit) but gets the client's connection closed on tonic (`GOAWAY header_list_way_too_large`, `UNAVAILABLE`) |
 | `maximum_concurrent_rpcs` | admission semaphore, `RESOURCE_EXHAUSTED` | `test_limits.py` | — |
 | `Keepalive(time_ms, timeout_ms)` | HTTP/2 keepalive interval and timeout | — | `permit_without_calls`: no such setting in tonic, ignored |
-| `run --workers` (port sharing) | `SO_REUSEPORT` (`("grpc.so_reuseport", 1)`) | `test_ops.py` | — |
+| `run --workers` (port sharing) | `SO_REUSEPORT` (`("grpc.so_reuseport", 1)`) | `test_ops.py` | not on Windows |
 | Health (`grpc.health.v1`) | the fastgrpc3 service, unchanged | `test_ops.py`; `grpc-health-probe` by hand | — |
 | Reflection v1 and v1alpha | the fastgrpc3 services, unchanged | `test_ops.py`; `grpcurl list/describe` by hand | — |
 | Interactive docs and JSON gateway | unchanged (HTTP side) | `test_docs.py` | — |

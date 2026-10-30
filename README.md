@@ -6,8 +6,9 @@ Python. HTTP/2, gRPC framing, TLS, compression and flow control run in Rust; the
 loop receives the calls by batches and runs them through fastgrpc3's own runtime, so
 services, dependencies, hooks, middlewares and errors behave as on `grpc.aio`.
 
-> **Status: experimental.** Tested on Linux only (the wake-up uses a Unix socket: no
-> Windows yet), not on PyPI yet. See `KNOWN_ISSUES.md` and the parity matrix `docs/PARITY.md`.
+> **Status: experimental.** Wheels for Linux (x86_64, aarch64), macOS (arm64, x86_64) and
+> Windows (x86_64), CPython 3.12 to 3.14, each tested in CI; not on PyPI yet. See
+> `KNOWN_ISSUES.md` and the parity matrix `docs/PARITY.md`.
 
 ## Use it
 
@@ -22,7 +23,7 @@ or `FASTGRPC_TRANSPORT=tonic`, or `GrpcApp(..., transport="tonic")`.
 
 On one core, fastgrpc3 serves a unary echo 6 to 10 times faster on tonic than on
 `grpc.aio` under concurrency (16 to 64 clients), about 2 times faster with one client
-(`bench/results/2026-10-30-lot4.md`).
+(`bench/results/2026-10-30-lot8.md`).
 
 ## Layout
 

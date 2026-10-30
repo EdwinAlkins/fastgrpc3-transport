@@ -5,12 +5,19 @@ to the development plan of the transport (lots 0 to 9, not published).
 
 | Issue | Effect | Lot |
 |-------|--------|-----|
-| The wake-up uses a Unix socket and `loop.add_reader` | not available on Windows (`ProactorEventLoop`) | 8 |
+| No port sharing on Windows (no `SO_REUSEPORT`) | `fastgrpc3 run --workers N` fails at start on Windows with tonic | — |
+| The Windows wake-up (loopback TCP, `sock_recv` task) has not been benchmarked against the Unix one | its throughput is unknown; tested for correctness only | 9 |
+| protoruf, fastgrpc3's codec, has no Linux aarch64 wheel | installing fastgrpc3 on Linux ARM64 compiles protoruf (this package installs without compiling) | protoruf |
 
 The differences left with `grpc.aio` on the common features are listed in
 `docs/PARITY.md`.
 
 Fixed:
+
+- Lot 8: Windows (the loop reads the wake-up socket with `sock_recv` where it cannot watch
+  it); wheels for Linux x86_64/aarch64, macOS arm64/x86_64 and Windows x86_64, CPython
+  3.12–3.14, each installed without compiling and tested in CI (`release.yml`); the
+  deadline margin that makes `DEADLINE_EXCEEDED` win over tonic's own timer every time.
 
 - Lot 6: response headers and trailers, peer, TLS and mTLS (identities, `auth_context`),
   gzip/deflate, message and metadata size limits, keepalive, `SO_REUSEPORT`
