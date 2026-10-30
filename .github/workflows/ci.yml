@@ -1,7 +1,7 @@
 name: CI
 
-# Rust: format (rustfmt defaults), clippy with every feature set, cargo test.
-# Python: build the extension with maturin and run the bridge tests (tests/python).
+# Rust: format (rustfmt defaults), clippy with every feature set, cargo test. The wheels
+# and the Python tests, on every platform, are in release.yml.
 on:
   push:
     branches: [main]
@@ -29,23 +29,3 @@ jobs:
       - name: Tests
         run: cargo test --all-targets
 
-  python:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.12', '3.13', '3.14']
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build and install the extension
-        run: |
-          python -m pip install maturin pytest pytest-asyncio "grpcio>=1.75.1"
-          maturin build --release --out dist
-          python -m pip install --no-index --find-links dist fastgrpc3-transport
-      - name: Bridge tests
-        run: python -m pytest

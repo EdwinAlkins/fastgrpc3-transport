@@ -1,0 +1,127 @@
+name: Release
+
+# Wheels for every supported platform and Python, each installed without compiling and
+# tested with fastgrpc3's suite on the tonic transport. On a `v*` tag, the same wheels go to
+# PyPI (trusted publishing, environment `pypi`) and to a GitHub release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  wheels:
+    name: wheels (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64 }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64 }
+          - { name: macos-arm64, runner: macos-14, target: aarch64 }
+          - { name: macos-x86_64, runner: macos-15-intel, target: x86_64 }
+          - { name: windows-x86_64, runner: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.13
+            3.14
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          # Regular CPython only: no abi3, no free-threaded build (not validated).
+          args: --release --out dist -i python3.12 python3.13 python3.14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  test:
+    name: test (${{ matrix.runner }}, Python ${{ matrix.python }})
+    needs: wheels
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-15-intel, windows-latest]
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: EdwinAlkins/fastgrpc3
+          path: fastgrpc3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # protoruf (a fastgrpc3 dependency) has no Linux ARM64 wheel yet: it is built here.
+      - if: runner.arch == 'ARM64' && runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: wheels
+          merge-multiple: true
+      - name: Install the wheel, without compiling
+        shell: bash
+        run: |
+          python -m pip install --only-binary fastgrpc3-transport --no-index \
+            --find-links wheels fastgrpc3-transport
+          python -m pip install ./fastgrpc3 pytest pytest-asyncio uvicorn
+      - name: fastgrpc3's suite on tonic
+        shell: bash
+        working-directory: fastgrpc3
+        run: python -m pytest -k tonic
+      - name: Bridge tests
+        # The benchmark bridge (bench/bridge.py) watches its socket with add_reader.
+        if: runner.os != 'Windows'
+        run: python -m pytest tests/python
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels, sdist, test]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing
+      contents: write  # the GitHub release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: The tag matches the version
+        run: |
+          version=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          test "v$version" = "$GITHUB_REF_NAME"
+      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # This version's section of the changelog.
+          awk -v v="${GITHUB_REF_NAME#v}" '
+            /^## \[/ { on = index($0, "[" v "]") > 0; next }
+            on' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md

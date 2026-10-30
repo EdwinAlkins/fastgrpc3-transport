@@ -6,3 +6,5 @@ pub mod echo;
 mod peer;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "python")]
+mod wake;

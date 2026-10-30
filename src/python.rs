@@ -21,8 +21,6 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::os::fd::IntoRawFd;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -48,7 +46,7 @@ use tonic::{Code, Status, Streaming};
 use tower::ServiceExt;
 
 use crate::echo::BytesCodec;
-use crate::peer;
+use crate::{peer, wake};
 
 type Answer = Result<Bytes, Status>;
 /// A unary answer: the response and its headers (and `Trailers` in its extensions).
@@ -143,7 +141,7 @@ enum Event {
 /// Events waiting for Python, and the socket that wakes the loop.
 struct Queue {
     events: Mutex<VecDeque<Event>>,
-    waker: UnixStream,
+    waker: wake::Waker,
     next_id: AtomicU64,
     /// Messages a server stream may have queued for tonic before `try_send` says `FULL`.
     stream_capacity: usize,
@@ -1170,13 +1168,12 @@ impl Server {
         self.start(bridge, "127.0.0.1", port)
     }
 
-    /// Variant B: listens on `host:port`, returns `(port, fd)`; the loop reads `fd` when
-    /// events are waiting, then calls `take()`.
+    /// Variant B: listens on `host:port`, returns `(port, socket)`; the loop reads
+    /// `socket` (a descriptor, or a `SOCKET` on Windows) when events are waiting, then
+    /// calls `take()`.
     #[pyo3(signature = (port, host = "127.0.0.1"))]
-    fn start_queue(&mut self, port: u16, host: &str) -> PyResult<(u16, i32)> {
-        let (python_end, waker) = UnixStream::pair()?;
-        python_end.set_nonblocking(true)?;
-        waker.set_nonblocking(true)?;
+    fn start_queue(&mut self, port: u16, host: &str) -> PyResult<(u16, i64)> {
+        let (waker, python_end) = wake::pair()?;
         let queue = Arc::new(Queue {
             events: Mutex::new(VecDeque::new()),
             waker,
@@ -1188,7 +1185,7 @@ impl Server {
         });
         self.queue = Some(queue.clone());
         let bound = self.start(Bridge::Queue(queue), host, port)?;
-        Ok((bound, python_end.into_raw_fd()))
+        Ok((bound, python_end))
     }
 
     /// At most `max_events` of the waiting events, oldest first: the new calls, the ids of
@@ -1382,7 +1379,13 @@ fn listen(host: &str, port: u16, reuse_port: bool) -> std::io::Result<std::net::
         Some(socket2::Protocol::TCP),
     )?;
     socket.set_reuse_address(true)?;
+    #[cfg(unix)]
     socket.set_reuse_port(true)?;
+    #[cfg(not(unix))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "port sharing (SO_REUSEPORT) is not available on this platform",
+    ));
     socket.bind(&address.into())?;
     socket.listen(1024)?;
     Ok(socket.into())
