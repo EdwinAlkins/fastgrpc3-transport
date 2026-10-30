@@ -270,10 +270,12 @@ impl Queue {
     }
 }
 
-/// The local, monotonic deadline of a call from its `grpc-timeout` header. Read when tonic
-/// hands the request over, just before it arms its own timer for the same header: ours
-/// never ends later, and tonic polls the call before its timer, so the client gets our
-/// `DEADLINE_EXCEEDED`, not tonic's `CANCELLED`.
+/// The local, monotonic deadline of a call from its `grpc-timeout` header, 1 ms early.
+/// tonic arms its own timer for the same header, and answers `CANCELLED: Timeout expired`
+/// when it fires first; we are called a few microseconds after it (axum calls a route on
+/// its first poll), so without the margin our timer sometimes lands one millisecond tick
+/// later (tokio's resolution). One millisecond early, ours always fires first, and the
+/// client gets `DEADLINE_EXCEEDED`, as from `grpc.aio`.
 fn deadline(headers: &http::HeaderMap) -> Option<Instant> {
     let value = headers.get("grpc-timeout")?.to_str().ok()?;
     let (amount, unit) = value.split_at(value.len().checked_sub(1)?);
@@ -287,7 +289,9 @@ fn deadline(headers: &http::HeaderMap) -> Option<Instant> {
         "n" => Duration::from_nanos(amount),
         _ => return None,
     };
-    Instant::now().checked_add(timeout)
+    Instant::now()
+        .checked_add(timeout)?
+        .checked_sub(Duration::from_millis(1))
 }
 
 /// Tells Python when tonic drops a call before its end (client gone, deadline, closed
