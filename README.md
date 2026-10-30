@@ -7,7 +7,7 @@ loop receives the calls by batches and runs them through fastgrpc3's own runtime
 services, dependencies, hooks, middlewares and errors behave as on `grpc.aio`.
 
 > **Status: experimental.** Wheels for Linux (x86_64, aarch64), macOS (arm64, x86_64) and
-> Windows (x86_64), CPython 3.12 to 3.14, each tested in CI; not on PyPI yet. See
+> Windows (x86_64), CPython 3.12 to 3.14, each tested in CI, on PyPI. See
 > `KNOWN_ISSUES.md` and the parity matrix `docs/PARITY.md`.
 
 ## Use it
@@ -15,7 +15,7 @@ services, dependencies, hooks, middlewares and errors behave as on `grpc.aio`.
 You do not import this package: fastgrpc3 selects it.
 
 ```bash
-pip install "fastgrpc3[tonic]"               # once published
+pip install "fastgrpc3[tonic]"
 fastgrpc3 run myapp.main:app --transport tonic
 ```
 
@@ -52,7 +52,7 @@ cargo clippy --all-targets --features python -- -D warnings
 cargo test --all-targets
 
 # This checkout into fastgrpc3's environment (`uv sync --extra tonic` there installs the
-# version on GitHub instead); add `--features variant-a` for the variant A benchmark.
+# version on PyPI instead); add `--features variant-a` for the variant A benchmark.
 maturin build --release -i ../fastgrpc/.venv/bin/python --out dist
 uv pip install --python ../fastgrpc/.venv --reinstall dist/fastgrpc3_transport-*.whl
 ../fastgrpc/.venv/bin/python -m pytest ../fastgrpc/tests   # fastgrpc3, on both transports
