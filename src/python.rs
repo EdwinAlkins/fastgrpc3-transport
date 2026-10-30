@@ -1395,5 +1395,7 @@ fn fastgrpc3_transport(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("SENT", SENT)?;
     module.add("FULL", FULL)?;
     module.add("CLOSED", CLOSED)?;
+    // The integration contract with fastgrpc3: bump it when this module's API changes.
+    module.add("TRANSPORT_API_VERSION", 1)?;
     Ok(())
 }

@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "fastgrpc3-transport"
-version = "0.0.0"
-description = "Spike S4: a tonic (Rust) gRPC server transport for fastgrpc3"
+version = "0.1.0"
+description = "A tonic gRPC server transport for fastgrpc3, with handlers written in Python"
 requires-python = ">=3.12"
 
 [tool.maturin]

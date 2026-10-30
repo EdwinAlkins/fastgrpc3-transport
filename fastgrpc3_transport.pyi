@@ -3,6 +3,7 @@
 SENT: int
 FULL: int
 CLOSED: int
+TRANSPORT_API_VERSION: int
 
 class Call:
     @property

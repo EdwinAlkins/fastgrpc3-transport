@@ -1,9 +1,9 @@
 [package]
 name = "fastgrpc3-transport"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Spike S4: a tonic (Rust) gRPC server transport for fastgrpc3"
+description = "A tonic gRPC server transport for fastgrpc3, with handlers written in Python"
 
 [lib]
 name = "fastgrpc3_transport"
