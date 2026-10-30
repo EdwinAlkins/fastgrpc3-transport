@@ -1,7 +1,7 @@
 # Known issues
 
-The prototype of spike S4 measures the bridge; it is not a transport yet. Lot numbers refer
-to `fastgrpc/private/docs/conception/11.1-transport-rust.md` (§17).
+What the transport does not do yet (it runs fastgrpc3 services since lot 4). Lot numbers refer
+to the development plan of the transport (lots 0 to 9, not published).
 
 | Issue | Effect | Lot |
 |-------|--------|-----|

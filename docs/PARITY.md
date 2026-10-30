@@ -3,7 +3,7 @@
 What fastgrpc3 offers on both transports, how the tonic transport provides it, and where it
 differs. "Tested" names the fastgrpc3 tests (`fastgrpc/tests/`), which run on both
 transports (`transport` fixture); the whole suite also passes with `FASTGRPC_TRANSPORT=tonic`.
-Plan: `fastgrpc/private/docs/conception/11.1-transport-rust.md` §8, lot 6.
+Plan: §8 and lot 6 of the development plan (not published).
 
 | Feature | tonic transport | Tested | Difference |
 |---|---|---|---|

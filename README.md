@@ -1,64 +1,78 @@
 # fastgrpc3-transport
 
-A gRPC server transport for [fastgrpc3](../fastgrpc) on
-[tonic](https://github.com/hyperium/tonic) (Rust, tokio), with the handlers still in
-Python. Today it is the prototype of spike S4; the plan to turn it into a transport is
-`fastgrpc/private/docs/conception/11.1-transport-rust.md`. Local only, nothing published.
+A gRPC server transport for [fastgrpc3](https://github.com/EdwinAlkins/fastgrpc3) on
+[tonic](https://github.com/hyperium/tonic) (Rust, tokio), with the handlers still written in
+Python. HTTP/2, gRPC framing, TLS, compression and flow control run in Rust; the asyncio
+loop receives the calls by batches and runs them through fastgrpc3's own runtime, so
+services, dependencies, hooks, middlewares and errors behave as on `grpc.aio`.
 
-**Spike S4 result** (`bench/results/2026-10-30.md`): on one core, medium message, the
-variant B bridge serves **27,326 / 32,406 requests/s at concurrency 16 / 64**, against
-4,163 / 4,096 for fastgrpc3 on `grpc.aio`: 6.6× / 7.9×, with p50 at c=64 down from 15.3 ms
-to 1.6 ms. On two cores, one process does 5.4× / 6.2× `fastgrpc3 run --workers 2`.
+> **Status: experimental.** Tested on Linux only (the wake-up uses a Unix socket: no
+> Windows yet), not on PyPI yet. See `KNOWN_ISSUES.md` and the parity matrix `docs/PARITY.md`.
 
-**Lot 1, server streams** (`bench/results/2026-10-30-streams.md`): 200,000 medium messages
-in 3.92 s (51,020 msg/s) against 6.96 s on `grpc.aio`, server memory flat; a reader that
-stops makes the producer stop, a client that cancels ends the handler.
+## Use it
 
-**Lot 2, variant B secured** (`bench/results/2026-10-30-lot2.md`): admission
-(`max_concurrent_rpcs`, `RESOURCE_EXHAUSTED`), bounded pump batches, one terminal state per
-RPC, graceful stop bounded by its grace period; unary throughput −1–5 % for the admission,
-still 6.3–8.0× `grpc.aio`.
+You do not import this package: fastgrpc3 selects it.
+
+```bash
+pip install "fastgrpc3[tonic]"               # once published
+fastgrpc3 run myapp.main:app --transport tonic
+```
+
+or `FASTGRPC_TRANSPORT=tonic`, or `GrpcApp(..., transport="tonic")`.
+
+On one core, fastgrpc3 serves a unary echo 6 to 10 times faster on tonic than on
+`grpc.aio` under concurrency (16 to 64 clients), about 2 times faster with one client
+(`bench/results/2026-10-30-lot4.md`).
 
 ## Layout
 
 | Path | What |
 |------|------|
+| `src/python.rs` | the PyO3 extension `fastgrpc3_transport`: `Server`, the routes, the event queue shared by tokio and asyncio (`take`), `Call` (answers, streams, metadata, deadline, peer) |
+| `src/peer.rs` | the mTLS client identity and `auth_context`, with `grpc`'s keys |
 | `src/echo.rs`, `src/bin/echo.rs` | a pure-Rust server answering every unary call with its request bytes: the transport's ceiling |
-| `src/python.rs` | the PyO3 extension `fastgrpc3_transport`: `Server(max_concurrent_rpcs=..., admission_timeout=..., stream_capacity=...)`, `add_route` / `start_queue` / `take(max_events)` / `shutdown(grace)` / `finished` / `join` (variant B, see `docs/ARCHITECTURE.md`), `Call.reply`, `try_send` / `when_writable` / `finish` for server streams, `fail`; `Server.start_direct` (variant A) behind the `variant-a` feature, for benchmarks |
-| `tests/echo.rs` | the echo server through a real tonic client (`cargo test`) |
-| `tests/python/` | the variant B bridge through a real `grpc.aio` client (`pytest`) |
-| `bench/` | the S4 benchmark (`s4_bench.py`), the stream benchmark (`stream_bench.py`), the asyncio side of variant B (`bridge.py`), the Python servers, and the results |
-| `KNOWN_ISSUES.md` | what the prototype does not do yet, and the lot of the plan that fixes it |
-| `PROGRESS.md` | where the work stands, step by step: read it first when resuming |
+| `fastgrpc3_transport.pyi` | the extension's types |
+| `docs/ARCHITECTURE.md` | how a call travels between tokio and asyncio |
+| `docs/PARITY.md` | each common feature with `grpc.aio`, its test, and the differences |
+| `tests/` | the echo server through a tonic client (`cargo test`), the bridge through a `grpc.aio` client (`pytest`) |
+| `bench/` | benchmarks against `grpc.aio`, and their results |
+
+fastgrpc3's side is `src/fastgrpc3/transport/tonic.py` in its repository; its test suite
+runs on both transports.
 
 ## Build and test
+
+With a Rust toolchain and [maturin](https://www.maturin.rs/), next to a checkout of
+fastgrpc3 (`../fastgrpc`):
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --features python -- -D warnings
 cargo test --all-targets
 
-# The extension, into fastgrpc3's environment (Python 3.12+); add `--features variant-a`
-# for the benchmark of variant A.
-../protoruf/.venv/bin/maturin build --release -i ../fastgrpc/.venv/bin/python --out dist
-uv pip install --python ../fastgrpc/.venv --reinstall dist/fastgrpc3_transport-*.whl
-../fastgrpc/.venv/bin/python -m pytest
+cd ../fastgrpc && uv sync --inexact --extra tonic   # builds and installs this package
+.venv/bin/python -m pytest                          # fastgrpc3, on both transports
+.venv/bin/python -m pytest ../fastgrpc3-transport/tests/python
 ```
+
+The variant A benchmark needs the `variant-a` feature:
+`maturin build --release --features variant-a -i ../fastgrpc/.venv/bin/python --out dist`,
+then `uv pip install --python ../fastgrpc/.venv --reinstall dist/*.whl`.
 
 ## Benchmark
 
-`bench/s4_bench.py` reuses fastgrpc3's harness (`fastgrpc/benches/e2e_bench.py`): each
-server is pinned to CPUs with all its threads, `ghz` loads it from others with the
-pre-encoded requests of `fastgrpc/benches/contract.py`.
+`bench/s4_bench.py` reuses fastgrpc3's harness (`benches/e2e_bench.py`): each server is
+pinned to CPUs, `ghz` loads it from others with pre-encoded requests.
 
 ```bash
 cargo build --release --bin echo
 ../fastgrpc/.venv/bin/python bench/s4_bench.py --servers raw fastgrpc3 tonic-echo tonic-B
-../fastgrpc/.venv/bin/python bench/s4_bench.py --servers fastgrpc3-2workers tonic-B \
-    --server-cpus 0,2 --client-cpus 4-15
+../fastgrpc/.venv/bin/python bench/stream_bench.py
 ```
 
-Servers: `raw` (`grpc.aio` + upb), `fastgrpc3` and `fastgrpc3-2workers` (on `grpc.aio`),
-`tonic-echo` (no Python), `tonic-A` / `tonic-B` (`bench/python_server.py`: decode and
-validate with `MessageCodec`, await the handler, encode, as fastgrpc3's fast path does),
-`tonic-B-2threads`.
+fastgrpc3 itself on each transport: `FASTGRPC_TRANSPORT=tonic python benches/e2e_bench.py
+--modes fastgrpc3` in its repository.
+
+## License
+
+MIT.

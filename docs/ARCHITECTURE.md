@@ -2,7 +2,7 @@
 
 How a unary call travels between tokio (Rust, no GIL) and asyncio (Python), as built in
 `src/python.rs` (`start_queue`). The design reference is
-`fastgrpc/private/docs/conception/11.1-transport-rust.md` (§5, §17).
+the development plan of the transport (§5, §17, not published).
 
 ```text
  tokio thread(s), no GIL                          asyncio loop, GIL

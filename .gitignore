@@ -2,3 +2,5 @@
 __pycache__/
 *.so
 /dist
+# Local resume log, not published
+PROGRESS.md
