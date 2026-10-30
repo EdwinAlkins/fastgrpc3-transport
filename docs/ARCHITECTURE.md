@@ -59,8 +59,33 @@ How a unary call travels between tokio (Rust, no GIL) and asyncio (Python), as b
   waits for room); `finish()` drops the sender, which ends the stream with `OK`.
 - A route unknown to the table answers `UNIMPLEMENTED` in Rust, before any Python.
 
+## Limits, terminal states, stop (lot 2)
+
+- **Admission**: one `Semaphore` of `max_concurrent_rpcs` permits. A call takes a permit
+  before it is queued (`Queue::admit`) and keeps it for its whole life on the tokio side:
+  the unary future holds it until the answer, a server stream's body (`Responses`) until
+  the stream ends. So one limit bounds the queue, the calls Python holds and the tasks the
+  pump started. When none is free, the call waits up to `admission_timeout` (zero: not at
+  all), then gets `RESOURCE_EXHAUSTED`; waiting is a tokio future, never a blocked thread.
+- **Fair pump**: `take(max_events)` hands out at most `max_events` events, oldest first,
+  and says whether more remain. The pump (`Bridge._pump`) then reschedules itself with
+  `loop.call_soon`: a push writes to the socket only when the queue goes from empty to
+  non-empty, so leftovers would otherwise wait for the next call. Other asyncio tasks run
+  between pump turns.
+- **Terminal states**: every RPC ends exactly once. `reply` / `fail` / `finish` take the
+  answer channel out of the `Call`; later answers are ignored. A `Call` freed without an
+  answer ends its RPC with `INTERNAL` (unary: the oneshot is dropped; stream: `Drop`
+  sends the status, or the dropped sender would end the stream with `OK`). The pump fails
+  a cancelled handler's call with `CANCELLED`.
+- **Graceful, bounded stop**: `Server.shutdown(grace)` returns at once. On the tokio
+  thread, tonic stops accepting and drains the calls in flight for at most `grace`; then
+  the serving future is dropped (remaining connections closed) and the runtime stops
+  (`shutdown_timeout(1 s)`). The asyncio loop keeps running meanwhile, so handlers in
+  flight can still answer: `await Bridge.stop(grace)` polls `finished()`, cancels the
+  handlers left, then `join()`s a thread that has already ended.
+
 ## Not there yet
 
-The prototype's limits are listed in `KNOWN_ISSUES.md`; the plan to remove them is lot 2
-(bounded queue and admission, fair pump, terminal states, graceful stop), lot 4 (client
-and bidirectional streams) and lot 5 (cancellation and deadlines) of the design note.
+The prototype's limits are listed in `KNOWN_ISSUES.md`; next in the plan: lot 3 (the
+fastgrpc3 side: `TransportContext`, backends), lot 4 (fastgrpc3's runtime on this
+transport, client and bidirectional streams), lot 5 (cancellation and deadlines).

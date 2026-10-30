@@ -11,7 +11,7 @@
 //!
 //! Routes are declared before starting (`add_route`); any other path is `UNIMPLEMENTED`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Write;
 use std::os::fd::IntoRawFd;
@@ -20,12 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use bytes::Bytes;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::body::Body;
 use tonic::server::{Grpc, ServerStreamingService, UnaryService};
@@ -70,18 +71,43 @@ enum Event {
 
 /// Events waiting for Python, and the socket that wakes the loop.
 struct Queue {
-    events: Mutex<Vec<Event>>,
+    events: Mutex<VecDeque<Event>>,
     waker: UnixStream,
     next_id: AtomicU64,
     /// Messages a server stream may have queued for tonic before `try_send` says `FULL`.
     stream_capacity: usize,
+    /// One permit per RPC alive on the tokio side: bounds the queue, the calls in Python
+    /// and their tasks at once.
+    admission: Arc<Semaphore>,
+    /// How long a call waits for a permit before `RESOURCE_EXHAUSTED` (zero: not at all).
+    admission_timeout: Duration,
 }
 
 impl Queue {
+    /// A permit for one more RPC, or `RESOURCE_EXHAUSTED`. Never blocks a thread.
+    async fn admit(&self) -> Result<OwnedSemaphorePermit, Status> {
+        let exhausted = || Status::resource_exhausted("too many concurrent calls");
+        if let Ok(permit) = self.admission.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        if self.admission_timeout.is_zero() {
+            return Err(exhausted());
+        }
+        match tokio::time::timeout(
+            self.admission_timeout,
+            self.admission.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(exhausted()),
+        }
+    }
+
     fn push(&self, event: Event) {
         let was_empty = {
             let mut events = self.events.lock().expect("queue");
-            events.push(event);
+            events.push_back(event);
             events.len() == 1
         };
         if was_empty {
@@ -132,7 +158,8 @@ impl UnaryService<Bytes> for Unary {
                     queue.call(path, body, Reply::Unary(sender));
                     receiver
                         .await
-                        .unwrap_or_else(|_| Err(Status::cancelled("call dropped")))
+                        // The `Call` was freed unanswered: a handler bug, not the client.
+                        .unwrap_or_else(|_| Err(Status::internal("the handler did not answer")))
                 }
                 #[cfg(feature = "variant-a")]
                 Bridge::Direct { handler, locals } => direct(&handler, &locals, path, body).await,
@@ -142,15 +169,15 @@ impl UnaryService<Bytes> for Unary {
     }
 }
 
-#[derive(Clone)]
 struct ServerStream {
     queue: Arc<Queue>,
     path: String,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ServerStreamingService<Bytes> for ServerStream {
     type Response = Bytes;
-    type ResponseStream = ReceiverStream<Answer>;
+    type ResponseStream = Responses;
     type Future = std::future::Ready<Result<tonic::Response<Self::ResponseStream>, Status>>;
 
     fn call(&mut self, request: tonic::Request<Bytes>) -> Self::Future {
@@ -160,7 +187,28 @@ impl ServerStreamingService<Bytes> for ServerStream {
         let path = self.path.clone();
         self.queue
             .call(path, request.into_inner(), Reply::Stream(sender));
-        std::future::ready(Ok(tonic::Response::new(ReceiverStream::new(receiver))))
+        let responses = Responses {
+            inner: ReceiverStream::new(receiver),
+            _permit: self.permit.take(),
+        };
+        std::future::ready(Ok(tonic::Response::new(responses)))
+    }
+}
+
+/// A server stream's responses; the RPC's admission permit lives as long as they do.
+struct Responses {
+    inner: ReceiverStream<Answer>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl tokio_stream::Stream for Responses {
+    type Item = Answer;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Answer>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(context)
     }
 }
 
@@ -206,18 +254,36 @@ impl tower::Service<http::Request<Body>> for Router {
         let path = request.uri().path().to_owned();
         let bridge = self.bridge.clone();
         match (self.routes.get(&path).copied(), bridge) {
-            (Some(Kind::Unary), bridge) => {
+            (Some(Kind::Unary), Bridge::Queue(queue)) => Box::pin(async move {
+                let _permit = match queue.admit().await {
+                    Ok(permit) => permit,
+                    Err(status) => return Ok(status.into_http()),
+                };
+                let unary = Unary {
+                    bridge: Bridge::Queue(queue),
+                    path,
+                };
+                Ok(Grpc::new(BytesCodec).unary(unary, request).await)
+            }),
+            #[cfg(feature = "variant-a")]
+            (Some(Kind::Unary), bridge @ Bridge::Direct { .. }) => {
                 let unary = Unary { bridge, path };
                 Box::pin(async move { Ok(Grpc::new(BytesCodec).unary(unary, request).await) })
             }
-            (Some(Kind::ServerStream), Bridge::Queue(queue)) => {
-                let stream = ServerStream { queue, path };
-                Box::pin(async move {
-                    Ok(Grpc::new(BytesCodec)
-                        .server_streaming(stream, request)
-                        .await)
-                })
-            }
+            (Some(Kind::ServerStream), Bridge::Queue(queue)) => Box::pin(async move {
+                let permit = match queue.admit().await {
+                    Ok(permit) => permit,
+                    Err(status) => return Ok(status.into_http()),
+                };
+                let stream = ServerStream {
+                    queue,
+                    path,
+                    permit: Some(permit),
+                };
+                Ok(Grpc::new(BytesCodec)
+                    .server_streaming(stream, request)
+                    .await)
+            }),
             #[cfg(feature = "variant-a")]
             (Some(Kind::ServerStream), Bridge::Direct { .. }) => {
                 let status = Status::unimplemented("variant A serves unary calls only");
@@ -245,6 +311,19 @@ struct Call {
     reply: Option<Reply>,
     queue: Arc<Queue>,
     runtime: tokio::runtime::Handle,
+}
+
+impl Drop for Call {
+    /// A stream left open by its handler must not end as a success: dropping the sender
+    /// alone would end it with `OK`.
+    fn drop(&mut self) {
+        if let Some(Reply::Stream(sender)) = self.reply.take() {
+            let status = Status::internal("the handler did not finish the stream");
+            self.runtime.spawn(async move {
+                let _ = sender.send(Err(status)).await;
+            });
+        }
+    }
 }
 
 #[pymethods]
@@ -332,24 +411,43 @@ impl Call {
 struct Server {
     threads: usize,
     stream_capacity: usize,
+    max_concurrent_rpcs: usize,
+    admission_timeout: Duration,
     routes: HashMap<String, Kind>,
     queue: Option<Arc<Queue>>,
     runtime: Option<tokio::runtime::Handle>,
-    shutdown: Option<oneshot::Sender<()>>,
+    /// Starts the graceful stop, with its grace period.
+    shutdown: Option<oneshot::Sender<Duration>>,
     thread: Option<JoinHandle<()>>,
 }
 
 #[pymethods]
 impl Server {
     #[new]
-    #[pyo3(signature = (threads = 1, stream_capacity = 16))]
-    fn new(threads: usize, stream_capacity: usize) -> PyResult<Self> {
-        if stream_capacity == 0 {
-            return Err(PyValueError::new_err("stream_capacity must be at least 1"));
+    #[pyo3(signature = (
+        threads = 1,
+        stream_capacity = 16,
+        max_concurrent_rpcs = 1024,
+        admission_timeout = 0.0,
+    ))]
+    fn new(
+        threads: usize,
+        stream_capacity: usize,
+        max_concurrent_rpcs: usize,
+        admission_timeout: f64,
+    ) -> PyResult<Self> {
+        if stream_capacity == 0 || max_concurrent_rpcs == 0 {
+            return Err(PyValueError::new_err(
+                "stream_capacity and max_concurrent_rpcs must be at least 1",
+            ));
         }
+        let admission_timeout = Duration::try_from_secs_f64(admission_timeout)
+            .map_err(|_| PyValueError::new_err("admission_timeout must be a duration >= 0"))?;
         Ok(Self {
             threads,
             stream_capacity,
+            max_concurrent_rpcs,
+            admission_timeout,
             routes: HashMap::new(),
             queue: None,
             runtime: None,
@@ -395,22 +493,32 @@ impl Server {
         python_end.set_nonblocking(true)?;
         waker.set_nonblocking(true)?;
         let queue = Arc::new(Queue {
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(VecDeque::new()),
             waker,
             next_id: AtomicU64::new(1),
             stream_capacity: self.stream_capacity,
+            admission: Arc::new(Semaphore::new(self.max_concurrent_rpcs)),
+            admission_timeout: self.admission_timeout,
         });
         self.queue = Some(queue.clone());
         let bound = self.start(Bridge::Queue(queue), port)?;
         Ok((bound, python_end.into_raw_fd()))
     }
 
-    /// The new calls, and the ids of the streams writable again, since the last `take`.
-    fn take(&self, py: Python<'_>) -> PyResult<(Vec<Call>, Vec<u64>)> {
+    /// At most `max_events` of the waiting events, oldest first: the new calls, the ids of
+    /// the streams writable again, and whether events remain. When some remain, call
+    /// `take` again without waiting for the socket: it is written only when the queue goes
+    /// from empty to non-empty.
+    #[pyo3(signature = (max_events = usize::MAX))]
+    fn take(&self, py: Python<'_>, max_events: usize) -> PyResult<(Vec<Call>, Vec<u64>, bool)> {
         let (Some(queue), Some(runtime)) = (&self.queue, &self.runtime) else {
             return Err(PyRuntimeError::new_err("not a started queue server"));
         };
-        let events = std::mem::take(&mut *queue.events.lock().expect("queue"));
+        let (events, more): (Vec<Event>, bool) = {
+            let mut waiting = queue.events.lock().expect("queue");
+            let count = waiting.len().min(max_events.max(1));
+            (waiting.drain(..count).collect(), !waiting.is_empty())
+        };
         let (mut calls, mut writable) = (Vec::new(), Vec::new());
         for event in events {
             match event {
@@ -425,19 +533,44 @@ impl Server {
                 Event::Writable(id) => writable.push(id),
             }
         }
-        Ok((calls, writable))
+        Ok((calls, writable, more))
     }
 
-    /// Stop serving and join the server thread.
-    fn stop(&mut self, py: Python<'_>) {
+    /// Start stopping, without blocking: refuse new calls, let the calls in flight finish
+    /// for `grace` seconds, then close the connections left and stop tokio. Keep the
+    /// asyncio loop running meanwhile (handlers may still be answering), poll `finished()`,
+    /// then `join()`.
+    #[pyo3(signature = (grace = 0.0))]
+    fn shutdown(&mut self, grace: f64) -> PyResult<()> {
+        let grace = Duration::try_from_secs_f64(grace)
+            .map_err(|_| PyValueError::new_err("grace must be a duration >= 0"))?;
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            let _ = shutdown.send(grace);
         }
+        Ok(())
+    }
+
+    /// Whether the server thread has ended (after `shutdown`).
+    fn finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Wait for the server thread (bounded once `shutdown` was called).
+    fn join(&mut self, py: Python<'_>) {
         if let Some(thread) = self.thread.take() {
             py.detach(|| {
                 let _ = thread.join();
             });
         }
+    }
+
+    /// `shutdown(grace)` then `join()`, blocking the calling thread: for scripts and
+    /// variant A. An asyncio application calls `shutdown` and waits for `finished()`.
+    #[pyo3(signature = (grace = 0.0))]
+    fn stop(&mut self, py: Python<'_>, grace: f64) -> PyResult<()> {
+        self.shutdown(grace)?;
+        self.join(py);
+        Ok(())
     }
 }
 
@@ -446,7 +579,7 @@ impl Server {
         let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
         listener.set_nonblocking(true)?;
         let bound = listener.local_addr()?.port();
-        let (shutdown, stopped) = oneshot::channel::<()>();
+        let (shutdown, stopped) = oneshot::channel::<Duration>();
         let (handle_sender, handle_receiver) = std::sync::mpsc::channel();
         let threads = self.threads;
         let routes = Arc::new(self.routes.clone());
@@ -478,13 +611,24 @@ impl Server {
                     );
                     let routes =
                         tonic::service::Routes::from(axum::Router::new().fallback_service(service));
-                    let _ = tonic::transport::Server::builder()
+                    let (graceful, drain) = oneshot::channel::<()>();
+                    let serve = tonic::transport::Server::builder()
                         .add_routes(routes)
                         .serve_with_incoming_shutdown(incoming, async {
-                            let _ = stopped.await;
-                        })
-                        .await;
+                            let _ = drain.await;
+                        });
+                    tokio::pin!(serve);
+                    let grace = tokio::select! {
+                        _ = &mut serve => return,
+                        grace = stopped => grace.unwrap_or(Duration::ZERO),
+                    };
+                    // tonic stops accepting and lets the calls in flight finish, for at most
+                    // `grace`; dropping `serve` then closes the connections left.
+                    let _ = graceful.send(());
+                    let _ = tokio::time::timeout(grace, &mut serve).await;
                 });
+                // Tasks still running (a stream's `when_writable`, `fail`) get a moment.
+                runtime.shutdown_timeout(Duration::from_secs(1));
             })?;
         self.runtime = Some(
             handle_receiver

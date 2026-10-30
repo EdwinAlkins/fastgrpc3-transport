@@ -14,16 +14,22 @@ to 1.6 ms. On two cores, one process does 5.4× / 6.2× `fastgrpc3 run --workers
 in 3.92 s (51,020 msg/s) against 6.96 s on `grpc.aio`, server memory flat; a reader that
 stops makes the producer stop, a client that cancels ends the handler.
 
+**Lot 2, variant B secured** (`bench/results/2026-10-30-lot2.md`): admission
+(`max_concurrent_rpcs`, `RESOURCE_EXHAUSTED`), bounded pump batches, one terminal state per
+RPC, graceful stop bounded by its grace period; unary throughput −1–5 % for the admission,
+still 6.3–8.0× `grpc.aio`.
+
 ## Layout
 
 | Path | What |
 |------|------|
 | `src/echo.rs`, `src/bin/echo.rs` | a pure-Rust server answering every unary call with its request bytes: the transport's ceiling |
-| `src/python.rs` | the PyO3 extension `fastgrpc3_transport`: `Server.add_route` / `start_queue` (variant B, see `docs/ARCHITECTURE.md`), `Call.reply`, `try_send` / `when_writable` / `finish` for server streams, `fail`; `Server.start_direct` (variant A) behind the `variant-a` feature, for benchmarks |
+| `src/python.rs` | the PyO3 extension `fastgrpc3_transport`: `Server(max_concurrent_rpcs=..., admission_timeout=..., stream_capacity=...)`, `add_route` / `start_queue` / `take(max_events)` / `shutdown(grace)` / `finished` / `join` (variant B, see `docs/ARCHITECTURE.md`), `Call.reply`, `try_send` / `when_writable` / `finish` for server streams, `fail`; `Server.start_direct` (variant A) behind the `variant-a` feature, for benchmarks |
 | `tests/echo.rs` | the echo server through a real tonic client (`cargo test`) |
 | `tests/python/` | the variant B bridge through a real `grpc.aio` client (`pytest`) |
 | `bench/` | the S4 benchmark (`s4_bench.py`), the stream benchmark (`stream_bench.py`), the asyncio side of variant B (`bridge.py`), the Python servers, and the results |
 | `KNOWN_ISSUES.md` | what the prototype does not do yet, and the lot of the plan that fixes it |
+| `PROGRESS.md` | where the work stands, step by step: read it first when resuming |
 
 ## Build and test
 

@@ -3,6 +3,7 @@ backpressure, cancellation and errors, unknown methods."""
 
 import asyncio
 import sys
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,15 +22,16 @@ Handlers = dict[str, Callable[[Call], Awaitable[None]]]
 
 @asynccontextmanager
 async def serving(
-    handlers: Handlers, stream_capacity: int = 16
+    handlers: Handlers, max_batch: int = 128, **options: float
 ) -> AsyncIterator[tuple[grpc.aio.Channel, Bridge]]:
-    bridge = Bridge(Server(threads=1, stream_capacity=stream_capacity), handlers)
+    """A server with `handlers` (`options` go to `Server`), and a channel to it."""
+    bridge = Bridge(Server(threads=1, **options), handlers, max_batch)
     port = bridge.start(0)
     try:
         async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
             yield channel, bridge
     finally:
-        bridge.stop()
+        await bridge.stop()
 
 
 # -- unary ---------------------------------------------------------------------------
@@ -82,6 +84,29 @@ async def test_unknown_methods_are_unimplemented() -> None:
     assert raised.value.details() == "no method /s.S/Nope"
 
 
+async def test_a_burst_is_served_in_bounded_batches() -> None:
+    """With `max_batch`, the pump takes a few events per loop turn and comes back for the
+    rest by itself (the socket is not written again while events remain): every call is
+    served, and other tasks run during the burst."""
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    async with serving({"/s.S/M0": echo}, max_batch=4) as (channel, bridge):
+        running = asyncio.ensure_future(ticker())
+        replies = await asyncio.gather(
+            *(channel.unary_unary("/s.S/M0")(str(i).encode()) for i in range(300))
+        )
+        running.cancel()
+    assert replies == [b"/s.S/M0" + str(i).encode() for i in range(300)]
+    assert sum(bridge.batches) == 300 and max(bridge.batches) <= 4
+    assert ticks > len(bridge.batches) / 2  # the ticker ran between pump turns
+
+
 # -- server streams -------------------------------------------------------------------
 
 
@@ -113,7 +138,7 @@ async def stream_server(
     box: list[Bridge] = []
     produced = [0]
     handlers: Handlers = {"/s.S/Stream": counting_stream(box, produced, fail_at)}
-    async with serving(handlers, stream_capacity) as (channel, bridge):
+    async with serving(handlers, stream_capacity=stream_capacity) as (channel, bridge):
         box.append(bridge)
         yield channel, bridge, produced
 
@@ -168,3 +193,167 @@ async def test_a_failing_stream_ends_with_its_status() -> None:
     assert received == [b"0", b"1", b"2"]
     assert raised.value.code() == grpc.StatusCode.INTERNAL
     assert raised.value.details() == "RuntimeError: broken"
+
+
+# -- admission ------------------------------------------------------------------------
+
+
+def holding() -> tuple[Handlers, asyncio.Event, list[int]]:
+    """`/s.S/Hold` waits for the event before answering; `/s.S/Get` answers at once."""
+    release, started = asyncio.Event(), []
+
+    async def hold(call: Call) -> None:
+        started.append(call.id)
+        await release.wait()
+        call.reply(b"held")
+
+    async def get(call: Call) -> None:
+        call.reply(b"ok")
+
+    return {"/s.S/Hold": hold, "/s.S/Get": get}, release, started
+
+
+async def until(condition: Callable[[], bool]) -> None:
+    for _ in range(200):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("timed out")
+
+
+async def test_calls_beyond_the_limit_are_refused() -> None:
+    handlers, release, started = holding()
+    async with serving(handlers, max_concurrent_rpcs=2) as (channel, _):
+        held = [asyncio.ensure_future(channel.unary_unary("/s.S/Hold")(b"")) for _ in range(2)]
+        await until(lambda: len(started) == 2)
+        with pytest.raises(grpc.aio.AioRpcError) as raised:
+            await channel.unary_unary("/s.S/Get")(b"")
+        assert raised.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+        release.set()
+        assert await asyncio.gather(*held) == [b"held", b"held"]
+        assert await channel.unary_unary("/s.S/Get")(b"") == b"ok"  # permits came back
+
+
+async def test_a_call_may_wait_for_a_permit() -> None:
+    handlers, release, started = holding()
+    async with serving(handlers, max_concurrent_rpcs=1, admission_timeout=5.0) as (channel, _):
+        held = asyncio.ensure_future(channel.unary_unary("/s.S/Hold")(b""))
+        await until(lambda: len(started) == 1)
+        waiting = asyncio.ensure_future(channel.unary_unary("/s.S/Get")(b""))
+        await asyncio.sleep(0.2)
+        assert not waiting.done()  # queued for a permit, not refused
+        release.set()
+        assert (await held, await waiting) == (b"held", b"ok")
+
+
+async def test_a_stream_holds_its_permit_until_it_ends() -> None:
+    box: list[Bridge] = []
+    produced = [0]
+    handlers: Handlers = {
+        "/s.S/Stream": counting_stream(box, produced, -1),
+        "/s.S/Get": holding()[0]["/s.S/Get"],
+    }
+    async with serving(handlers, max_concurrent_rpcs=1) as (channel, bridge):
+        box.append(bridge)
+        stream = channel.unary_stream("/s.S/Stream")(b"40000,1024")
+        await stream.read()  # open, and paused by backpressure
+        with pytest.raises(grpc.aio.AioRpcError) as raised:
+            await channel.unary_unary("/s.S/Get")(b"")
+        assert raised.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+        while await stream.read() is not grpc.aio.EOF:
+            pass
+        await until(lambda: not bridge.tasks)
+        assert await channel.unary_unary("/s.S/Get")(b"") == b"ok"
+
+
+# -- terminal states ------------------------------------------------------------------
+
+
+async def test_handlers_that_do_not_answer_end_with_internal() -> None:
+    async def silent(call: Call) -> None:
+        return None  # no reply
+
+    @streaming
+    async def silent_stream(call: Call) -> None:
+        return None  # no finish
+
+    handlers: Handlers = {"/s.S/Unary": silent, "/s.S/Stream": silent_stream}
+    async with serving(handlers) as (channel, _):
+        with pytest.raises(grpc.aio.AioRpcError) as unary:
+            await channel.unary_unary("/s.S/Unary")(b"")
+        with pytest.raises(grpc.aio.AioRpcError) as stream:
+            [m async for m in channel.unary_stream("/s.S/Stream")(b"")]
+    assert (unary.value.code(), unary.value.details()) == (
+        grpc.StatusCode.INTERNAL,
+        "the handler did not answer",
+    )
+    assert (stream.value.code(), stream.value.details()) == (
+        grpc.StatusCode.INTERNAL,
+        "the handler did not finish the stream",
+    )
+
+
+async def test_a_cancelled_task_ends_its_call_with_cancelled() -> None:
+    handlers, _release, started = holding()
+    async with serving(handlers) as (channel, bridge):
+        call = asyncio.ensure_future(channel.unary_unary("/s.S/Hold")(b""))
+        await until(lambda: len(started) == 1)
+        for task in bridge.tasks:
+            task.cancel()
+        with pytest.raises(grpc.aio.AioRpcError) as raised:
+            await call
+    assert raised.value.code() == grpc.StatusCode.CANCELLED
+
+
+# -- graceful stop --------------------------------------------------------------------
+
+
+async def test_stop_lets_calls_in_flight_finish() -> None:
+    async def slow(call: Call) -> None:
+        await asyncio.sleep(0.3)
+        call.reply(b"done")
+
+    bridge = Bridge(Server(threads=1), {"/s.S/Slow": slow})
+    port = bridge.start(0)
+    async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+        call = asyncio.ensure_future(channel.unary_unary("/s.S/Slow")(b""))
+        await until(lambda: bool(bridge.tasks))
+        started = time.monotonic()
+        await bridge.stop(grace=5.0)
+        elapsed = time.monotonic() - started
+        assert await call == b"done"
+    assert 0.2 < elapsed < 2.0  # as long as the call needed, not the whole grace
+
+
+async def test_stop_is_bounded_by_the_grace_period() -> None:
+    """An endless stream whose client does not read: the grace period ends it."""
+    box: list[Bridge] = []
+    produced = [0]
+    bridge = Bridge(Server(threads=1), {"/s.S/Stream": counting_stream(box, produced, -1)})
+    box.append(bridge)
+    port = bridge.start(0)
+    async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+        stream = channel.unary_stream("/s.S/Stream")(b"1000000,1024")
+        await stream.read()
+        await until(lambda: produced[0] > 100)
+        started = time.monotonic()
+        await bridge.stop(grace=0.5)
+        elapsed = time.monotonic() - started
+        assert not bridge.tasks  # the handler was cancelled
+        with pytest.raises(grpc.aio.AioRpcError):
+            while await stream.read() is not grpc.aio.EOF:
+                pass
+    assert 0.4 < elapsed < 3.0
+
+
+async def test_an_idle_connection_does_not_delay_the_stop() -> None:
+    bridge = Bridge(Server(threads=1), {"/s.S/Get": echo})
+    port = bridge.start(0)
+    async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+        await channel.unary_unary("/s.S/Get")(b"")  # the connection stays open, idle
+        started = time.monotonic()
+        await bridge.stop(grace=5.0)
+        assert time.monotonic() - started < 1.0
+        with pytest.raises(grpc.aio.AioRpcError) as raised:
+            await channel.unary_unary("/s.S/Get")(b"", timeout=2)
+    assert raised.value.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)

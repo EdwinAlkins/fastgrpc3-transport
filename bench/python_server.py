@@ -73,7 +73,7 @@ async def queue(port: int, stop: asyncio.Event, threads: int) -> None:
     handlers["/bench.v1.Streams/Down"] = _down(bridge)
     bridge.start(port)
     await stop.wait()
-    bridge.stop()
+    await bridge.stop()
 
 
 def _unary(handle: Handle) -> Callable[[Call], Awaitable[None]]:
