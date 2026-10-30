@@ -28,7 +28,7 @@ First release: an experimental gRPC server transport for fastgrpc3 on tonic, sel
   deflate; message and metadata size limits; HTTP/2 keepalive; port sharing
   (`SO_REUSEPORT`, Linux and macOS) for `fastgrpc3 run --workers`.
 - Graceful stop bounded by its grace period.
-- `TRANSPORT_API_VERSION = 1`, checked by fastgrpc3.
+- `TRANSPORT_API_VERSION = 2`, checked by fastgrpc3.
 
 ### Packaging
 
