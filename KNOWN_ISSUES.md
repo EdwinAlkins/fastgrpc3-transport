@@ -5,12 +5,17 @@ to `fastgrpc/private/docs/conception/11.1-transport-rust.md` (§17).
 
 | Issue | Effect | Lot |
 |-------|--------|-----|
-| A client's cancellation or deadline does not reach the Python task, except a server stream's next `send` (which returns `False`) | a unary handler, or a stream between two sends, keeps running after the RPC is gone | 5 |
 | No response metadata (headers, trailers), no peer through the bridge | `Context.send_initial_metadata` / `set_trailing_metadata` raise `NotImplementedError` in fastgrpc3 | 6 |
 | Plaintext only; no compression, keepalive or size limits other than tonic's defaults | fastgrpc3 refuses these settings with `transport="tonic"` (but does not enforce `max_send_bytes`) | 6 |
 | The wake-up uses a Unix socket and `loop.add_reader` | not available on Windows (`ProactorEventLoop`) | 8 |
 
 Fixed:
+
+- Lot 5: a call tonic gives up before its end (client gone, deadline, closed connection,
+  stop) is reported to Python (`take()`'s cancelled ids) and its task cancelled; the
+  `grpc-timeout` deadline is read when tonic hands the request over (`Call.time_remaining()`),
+  enforced by the bridge for unary and client stream calls (`DEADLINE_EXCEEDED`, not tonic's
+  `CANCELLED: Timeout expired`) and for response streams (tonic bounds only the headers).
 
 - Lot 4: client and bidirectional streams (`client_stream`, `bidi_stream` routes; requests
   read one message per credit, `Call.consumed()`), request metadata (`Call.metadata()`,

@@ -4,8 +4,10 @@
 //!   queue without the GIL and wake the loop through a socket only when the queue was empty;
 //!   Python drains it by batches (`take`). Events are new calls, answered through their
 //!   `Call` (`reply`, `try_send` / `finish`, `fail`), "writable again" notices for
-//!   response streams whose bounded channel was full (`when_writable`), and the messages
-//!   of request streams (one per credit, given back by `consumed`).
+//!   response streams whose bounded channel was full (`when_writable`), the messages of
+//!   request streams (one per credit, given back by `consumed`), and the calls tonic gave up
+//!   before their end (client gone, deadline, closed connection, stop): Python cancels
+//!   their task.
 //! - `start_direct` (variant A, feature `variant-a`, benchmarks only, unary only): each call
 //!   takes the GIL on a tokio thread and schedules its coroutine on the asyncio loop
 //!   (`pyo3-async-runtimes`), one wake-up per call.
@@ -21,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -66,6 +68,7 @@ struct Pending {
     path: String,
     /// Converted for Python only if it asks (`Call.metadata()`).
     metadata: MetadataMap,
+    deadline: Option<Instant>,
     body: Bytes,
     reply: Reply,
     requests: Option<Requests>,
@@ -86,6 +89,8 @@ enum Event {
     /// A request message of call `id`; `None` once the stream ends, cleanly (`true`) or
     /// not (`false`: reset by the client, malformed).
     Request(u64, Option<Bytes>, bool),
+    /// tonic dropped call `id` before its end: cancel its handler.
+    Cancelled(u64),
 }
 
 /// Events waiting for Python, and the socket that wakes the loop.
@@ -135,16 +140,77 @@ impl Queue {
         }
     }
 
-    fn call(&self, path: String, metadata: MetadataMap, body: Bytes, reply: Reply) {
+    /// Queue a call; returns its id.
+    fn call(
+        &self,
+        path: String,
+        metadata: MetadataMap,
+        deadline: Option<Instant>,
+        body: Bytes,
+        reply: Reply,
+    ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.push(Event::Call(Pending {
             id,
             path,
             metadata,
+            deadline,
             body,
             reply,
             requests: None,
         }));
+        id
+    }
+}
+
+/// The local, monotonic deadline of a call from its `grpc-timeout` header. Read when tonic
+/// hands the request over, just before it arms its own timer for the same header: ours
+/// never ends later, and tonic polls the call before its timer, so the client gets our
+/// `DEADLINE_EXCEEDED`, not tonic's `CANCELLED`.
+fn deadline(headers: &http::HeaderMap) -> Option<Instant> {
+    let value = headers.get("grpc-timeout")?.to_str().ok()?;
+    let (amount, unit) = value.split_at(value.len().checked_sub(1)?);
+    let amount: u64 = amount.parse().ok()?;
+    let timeout = match unit {
+        "H" => Duration::from_secs(amount.checked_mul(3600)?),
+        "M" => Duration::from_secs(amount.checked_mul(60)?),
+        "S" => Duration::from_secs(amount),
+        "m" => Duration::from_millis(amount),
+        "u" => Duration::from_micros(amount),
+        "n" => Duration::from_nanos(amount),
+        _ => return None,
+    };
+    Instant::now().checked_add(timeout)
+}
+
+/// Tells Python when tonic drops a call before its end (client gone, deadline, closed
+/// connection, stop), so that its handler is cancelled. Disarmed once the call has ended.
+struct Watch {
+    queue: Arc<Queue>,
+    id: u64,
+    armed: bool,
+}
+
+impl Watch {
+    fn new(queue: Arc<Queue>, id: u64) -> Self {
+        Self {
+            queue,
+            id,
+            armed: true,
+        }
+    }
+
+    /// A method, not a field write: an `async move` block then captures the whole guard.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        if self.armed {
+            self.queue.push(Event::Cancelled(self.id));
+        }
     }
 }
 
@@ -153,9 +219,10 @@ impl Queue {
 fn call_streaming(
     queue: &Arc<Queue>,
     path: String,
+    deadline: Option<Instant>,
     request: tonic::Request<Streaming<Bytes>>,
     reply: Reply,
-) {
+) -> u64 {
     let (metadata, _, requests) = request.into_parts();
     let id = queue.next_id.fetch_add(1, Ordering::Relaxed);
     // No credit until the call is queued: its messages must not overtake it.
@@ -165,6 +232,7 @@ fn call_streaming(
         id,
         path,
         metadata,
+        deadline,
         body: Bytes::new(),
         reply,
         requests: Some(Requests {
@@ -173,6 +241,7 @@ fn call_streaming(
         }),
     }));
     credits.add_permits(queue.stream_capacity);
+    id
 }
 
 async fn feed(queue: Arc<Queue>, id: u64, mut requests: Streaming<Bytes>, credits: Arc<Semaphore>) {
@@ -194,11 +263,23 @@ async fn feed(queue: Arc<Queue>, id: u64, mut requests: Streaming<Bytes>, credit
     }
 }
 
-async fn answer(receiver: oneshot::Receiver<Answer>) -> Answer {
-    receiver
-        .await
-        // The `Call` was freed unanswered: a handler bug, not the client.
-        .unwrap_or_else(|_| Err(Status::internal("the handler did not answer")))
+/// The handler's answer, or `DEADLINE_EXCEEDED`. The watch stays armed when the answer
+/// does not come (deadline, or tonic dropping this future): the handler is cancelled.
+async fn answer(
+    receiver: oneshot::Receiver<Answer>,
+    deadline: Option<Instant>,
+    mut watch: Watch,
+) -> Answer {
+    let received = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline.into(), receiver).await {
+            Ok(received) => received,
+            Err(_) => return Err(Status::deadline_exceeded("deadline exceeded")),
+        },
+        None => receiver.await,
+    };
+    watch.disarm();
+    // The `Call` was freed unanswered: a handler bug, not the client.
+    received.unwrap_or_else(|_| Err(Status::internal("the handler did not answer")))
 }
 
 /// How a call reaches Python.
@@ -216,6 +297,7 @@ enum Bridge {
 struct Unary {
     bridge: Bridge,
     path: String,
+    deadline: Option<Instant>,
 }
 
 impl UnaryService<Bytes> for Unary {
@@ -223,14 +305,15 @@ impl UnaryService<Bytes> for Unary {
     type Future = BoxFuture<Result<tonic::Response<Bytes>, Status>>;
 
     fn call(&mut self, request: tonic::Request<Bytes>) -> Self::Future {
-        let (bridge, path) = (self.bridge.clone(), self.path.clone());
+        let (bridge, path, deadline) = (self.bridge.clone(), self.path.clone(), self.deadline);
         let (metadata, _, body) = request.into_parts();
         Box::pin(async move {
             let answer = match bridge {
                 Bridge::Queue(queue) => {
                     let (sender, receiver) = oneshot::channel();
-                    queue.call(path, metadata, body, Reply::Unary(sender));
-                    answer(receiver).await
+                    let reply = Reply::Unary(sender);
+                    let id = queue.call(path, metadata, deadline, body, reply);
+                    answer(receiver, deadline, Watch::new(queue, id)).await
                 }
                 #[cfg(feature = "variant-a")]
                 Bridge::Direct { handler, locals } => direct(&handler, &locals, path, body).await,
@@ -244,6 +327,7 @@ impl UnaryService<Bytes> for Unary {
 struct ClientStream {
     queue: Arc<Queue>,
     path: String,
+    deadline: Option<Instant>,
 }
 
 impl ClientStreamingService<Bytes> for ClientStream {
@@ -252,13 +336,14 @@ impl ClientStreamingService<Bytes> for ClientStream {
 
     fn call(&mut self, request: tonic::Request<Streaming<Bytes>>) -> Self::Future {
         let (sender, receiver) = oneshot::channel();
-        call_streaming(
-            &self.queue,
-            self.path.clone(),
-            request,
-            Reply::Unary(sender),
-        );
-        Box::pin(async move { answer(receiver).await.map(tonic::Response::new) })
+        let (path, deadline) = (self.path.clone(), self.deadline);
+        let id = call_streaming(&self.queue, path, deadline, request, Reply::Unary(sender));
+        let watch = Watch::new(self.queue.clone(), id);
+        Box::pin(async move {
+            answer(receiver, deadline, watch)
+                .await
+                .map(tonic::Response::new)
+        })
     }
 }
 
@@ -266,19 +351,25 @@ impl ClientStreamingService<Bytes> for ClientStream {
 struct ResponseStream {
     queue: Arc<Queue>,
     path: String,
+    deadline: Option<Instant>,
     permit: Option<OwnedSemaphorePermit>,
 }
 
 type StreamFuture = std::future::Ready<Result<tonic::Response<Responses>, Status>>;
 
 impl ResponseStream {
-    fn respond(&mut self, start: impl FnOnce(Reply)) -> StreamFuture {
+    fn respond(&mut self, start: impl FnOnce(Reply) -> u64) -> StreamFuture {
         // Bounded: tonic pulls a message only when HTTP/2 can send it, so a slow client
         // fills this channel and `try_send` tells the handler to wait.
         let (sender, receiver) = mpsc::channel(self.queue.stream_capacity);
-        start(Reply::Stream(sender));
+        let id = start(Reply::Stream(sender));
         let responses = Responses {
             inner: ReceiverStream::new(receiver),
+            deadline: self
+                .deadline
+                .map(|deadline| Box::pin(tokio::time::sleep_until(deadline.into()))),
+            ended: false,
+            watch: Watch::new(self.queue.clone(), id),
             _permit: self.permit.take(),
         };
         std::future::ready(Ok(tonic::Response::new(responses)))
@@ -291,9 +382,9 @@ impl ServerStreamingService<Bytes> for ResponseStream {
     type Future = StreamFuture;
 
     fn call(&mut self, request: tonic::Request<Bytes>) -> Self::Future {
-        let (queue, path) = (self.queue.clone(), self.path.clone());
+        let (queue, path, deadline) = (self.queue.clone(), self.path.clone(), self.deadline);
         let (metadata, _, body) = request.into_parts();
-        self.respond(|reply| queue.call(path, metadata, body, reply))
+        self.respond(|reply| queue.call(path, metadata, deadline, body, reply))
     }
 }
 
@@ -303,14 +394,18 @@ impl StreamingService<Bytes> for ResponseStream {
     type Future = StreamFuture;
 
     fn call(&mut self, request: tonic::Request<Streaming<Bytes>>) -> Self::Future {
-        let (queue, path) = (self.queue.clone(), self.path.clone());
-        self.respond(|reply| call_streaming(&queue, path, request, reply))
+        let (queue, path, deadline) = (self.queue.clone(), self.path.clone(), self.deadline);
+        self.respond(|reply| call_streaming(&queue, path, deadline, request, reply))
     }
 }
 
 /// A response stream; the RPC's admission permit lives as long as it does.
 struct Responses {
     inner: ReceiverStream<Answer>,
+    /// Enforced here: tonic bounds the response headers by the deadline, not a stream.
+    deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    ended: bool,
+    watch: Watch,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -321,7 +416,22 @@ impl tokio_stream::Stream for Responses {
         mut self: std::pin::Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Answer>> {
-        std::pin::Pin::new(&mut self.inner).poll_next(context)
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        if let Some(deadline) = &mut self.deadline
+            && deadline.as_mut().poll(context).is_ready()
+        {
+            // The watch stays armed: the handler is cancelled when tonic drops the stream.
+            self.ended = true;
+            return Poll::Ready(Some(Err(Status::deadline_exceeded("deadline exceeded"))));
+        }
+        let item = std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_next(context));
+        if !matches!(item, Some(Ok(_))) {
+            self.ended = true;
+            self.watch.armed = false;
+        }
+        Poll::Ready(item)
     }
 }
 
@@ -365,6 +475,7 @@ impl tower::Service<http::Request<Body>> for Router {
 
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
         let path = request.uri().path().to_owned();
+        let deadline = deadline(request.headers());
         let bridge = self.bridge.clone();
         match (self.routes.get(&path).copied(), bridge) {
             (Some(kind), Bridge::Queue(queue)) => Box::pin(async move {
@@ -378,17 +489,27 @@ impl tower::Service<http::Request<Body>> for Router {
                     Kind::Unary => {
                         let _permit = permit;
                         let bridge = Bridge::Queue(queue);
-                        grpc.unary(Unary { bridge, path }, request).await
+                        let unary = Unary {
+                            bridge,
+                            path,
+                            deadline,
+                        };
+                        grpc.unary(unary, request).await
                     }
                     Kind::ClientStream => {
                         let _permit = permit;
-                        grpc.client_streaming(ClientStream { queue, path }, request)
-                            .await
+                        let stream = ClientStream {
+                            queue,
+                            path,
+                            deadline,
+                        };
+                        grpc.client_streaming(stream, request).await
                     }
                     Kind::ServerStream | Kind::BidiStream => {
                         let stream = ResponseStream {
                             queue,
                             path,
+                            deadline,
                             permit: Some(permit),
                         };
                         if kind == Kind::ServerStream {
@@ -401,7 +522,11 @@ impl tower::Service<http::Request<Body>> for Router {
             }),
             #[cfg(feature = "variant-a")]
             (Some(Kind::Unary), bridge @ Bridge::Direct { .. }) => {
-                let unary = Unary { bridge, path };
+                let unary = Unary {
+                    bridge,
+                    path,
+                    deadline,
+                };
                 Box::pin(async move { Ok(Grpc::new(BytesCodec).unary(unary, request).await) })
             }
             #[cfg(feature = "variant-a")]
@@ -430,6 +555,7 @@ struct Call {
     #[pyo3(get)]
     body: Py<PyBytes>,
     metadata: MetadataMap,
+    deadline: Option<Instant>,
     reply: Option<Reply>,
     requests: Option<Requests>,
     queue: Arc<Queue>,
@@ -478,6 +604,15 @@ impl Call {
                 }
             })
             .collect()
+    }
+
+    /// Seconds left before the call's deadline, `None` without one.
+    fn time_remaining(&self) -> Option<f64> {
+        self.deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64()
+        })
     }
 
     /// One request message handled: the feeder may read one more.
@@ -669,7 +804,8 @@ impl Server {
 
     /// At most `max_events` of the waiting events, oldest first: the new calls, the ids of
     /// the streams writable again, the request messages `(id, bytes, True)` and request
-    /// stream ends `(id, None, clean)`, and whether events remain. When some remain, call
+    /// stream ends `(id, None, clean)`, the ids of the calls tonic gave up (cancel their
+    /// handler), and whether events remain. When some remain, call
     /// `take` again without waiting for the socket: it is written only when the queue goes
     /// from empty to non-empty. A call's messages always come after the call.
     #[pyo3(signature = (max_events = usize::MAX))]
@@ -683,6 +819,7 @@ impl Server {
             (waiting.drain(..count).collect(), !waiting.is_empty())
         };
         let (mut calls, mut writable, mut requests) = (Vec::new(), Vec::new(), Vec::new());
+        let mut cancelled = Vec::new();
         for event in events {
             match event {
                 Event::Call(call) => calls.push(Call {
@@ -690,6 +827,7 @@ impl Server {
                     path: call.path,
                     body: PyBytes::new(py, &call.body).unbind(),
                     metadata: call.metadata,
+                    deadline: call.deadline,
                     reply: Some(call.reply),
                     requests: call.requests,
                     queue: queue.clone(),
@@ -700,9 +838,10 @@ impl Server {
                     let message = message.map(|data| PyBytes::new(py, &data).unbind());
                     requests.push((id, message, ok));
                 }
+                Event::Cancelled(id) => cancelled.push(id),
             }
         }
-        Ok((calls, writable, requests, more))
+        Ok((calls, writable, requests, cancelled, more))
     }
 
     /// Start stopping, without blocking: refuse new calls, let the calls in flight finish
@@ -747,6 +886,7 @@ type Taken = (
     Vec<Call>,
     Vec<u64>,
     Vec<(u64, Option<Py<PyBytes>>, bool)>,
+    Vec<u64>,
     bool,
 );
 

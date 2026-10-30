@@ -86,7 +86,8 @@ class Bridge:
 
     def _pump(self) -> None:
         assert self._loop is not None
-        calls, writable, _, more = self.server.take(self.max_batch)  # no request streams here
+        # No request streams here; a call tonic gave up ends on its next `send` (False).
+        calls, writable, _, _, more = self.server.take(self.max_batch)
         if more:  # the socket will not be written again until the queue empties
             self._loop.call_soon(self._pump)
         self.batches.append(len(calls))
