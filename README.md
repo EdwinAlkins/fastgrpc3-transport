@@ -50,14 +50,13 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --features python -- -D warnings
 cargo test --all-targets
 
-cd ../fastgrpc && uv sync --inexact --extra tonic   # builds and installs this package
-.venv/bin/python -m pytest                          # fastgrpc3, on both transports
-.venv/bin/python -m pytest ../fastgrpc3-transport/tests/python
+# This checkout into fastgrpc3's environment (`uv sync --extra tonic` there installs the
+# version on GitHub instead); add `--features variant-a` for the variant A benchmark.
+maturin build --release -i ../fastgrpc/.venv/bin/python --out dist
+uv pip install --python ../fastgrpc/.venv --reinstall dist/fastgrpc3_transport-*.whl
+../fastgrpc/.venv/bin/python -m pytest ../fastgrpc/tests   # fastgrpc3, on both transports
+../fastgrpc/.venv/bin/python -m pytest tests/python
 ```
-
-The variant A benchmark needs the `variant-a` feature:
-`maturin build --release --features variant-a -i ../fastgrpc/.venv/bin/python --out dist`,
-then `uv pip install --python ../fastgrpc/.venv --reinstall dist/*.whl`.
 
 ## Benchmark
 
