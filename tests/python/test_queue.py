@@ -384,3 +384,32 @@ def test_misuse_is_refused() -> None:
     finally:
         server.stop()
 
+
+async def test_a_request_stream_held_by_python_is_bounded_in_bytes() -> None:
+    server = Server(threads=1)
+    server.add_route("/s.S/Up", "client_stream")
+    port, _ = server.start_queue(0)
+    calls: list[Call] = []
+    received: list[bytes] = []
+
+    def taken(count: int) -> bool:
+        new_calls, _, requests, _, _ = server.take()
+        calls.extend(new_calls)
+        received.extend(message for _, message, _ in requests if message is not None)
+        return len(received) >= count
+
+    async def messages() -> AsyncIterator[bytes]:
+        for _ in range(8):
+            yield b"x" * (512 * 1024)
+
+    try:
+        async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+            rpc = channel.stream_unary("/s.S/Up")(messages())
+            await until(lambda: taken(2))
+            await asyncio.sleep(0.2)
+            assert not taken(3)  # 1 MiB unconsumed: the feeder waits, not 16 messages
+            calls[0].consumed()
+            await until(lambda: taken(3))
+            rpc.cancel()
+    finally:
+        server.stop()

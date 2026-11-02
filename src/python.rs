@@ -54,6 +54,11 @@ type UnaryAnswer = Result<tonic::Response<Bytes>, Status>;
 type StreamFuture = BoxFuture<Result<tonic::Response<Responses>, Status>>;
 type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
+/// The bytes of a request stream Python may hold unconsumed before its feeder stops
+/// reading (plus one message): with `stream_capacity`, bounds a stream to
+/// `min(stream_capacity × max_recv_bytes, STREAM_BYTES + max_recv_bytes)`.
+const STREAM_BYTES: usize = 1 << 20;
+
 /// Events after which tokio wakes Python without waiting to sleep first.
 const WAKE_AT: usize = 64;
 
@@ -119,10 +124,12 @@ struct Pending {
     requests: Option<Requests>,
 }
 
-/// The request stream of a call: its feeder task reads one message per credit, so a
+/// The request stream of a call: its feeder task stops reading while Python holds
+/// `stream_capacity` messages or `STREAM_BYTES` of this stream not yet consumed, so a
 /// handler that reads slowly slows the client down (HTTP/2 flow control), not memory.
 struct Requests {
-    credits: Arc<Semaphore>,
+    /// One permit per message consumed by Python (and one when the call is queued).
+    consumed: Arc<Semaphore>,
     feeder: tokio::task::AbortHandle,
 }
 
@@ -366,9 +373,8 @@ fn call_streaming(
     let peer = Peer::of(&request);
     let (metadata, _, requests) = request.into_parts();
     let id = queue.next_id.fetch_add(1, Ordering::Relaxed);
-    // No credit until the call is queued: its messages must not overtake it.
-    let credits = Arc::new(Semaphore::new(0));
-    let feeder = tokio::spawn(feed(queue.clone(), id, requests, credits.clone())).abort_handle();
+    let consumed = Arc::new(Semaphore::new(0));
+    let feeder = tokio::spawn(feed(queue.clone(), id, requests, consumed.clone())).abort_handle();
     queue.push(Event::Call(Pending {
         id,
         path,
@@ -378,22 +384,43 @@ fn call_streaming(
         body: Bytes::new(),
         reply,
         requests: Some(Requests {
-            credits: credits.clone(),
+            consumed: consumed.clone(),
             feeder,
         }),
     }));
-    credits.add_permits(queue.stream_capacity);
+    consumed.add_permits(1); // the feeder's start: its messages must not overtake the call
     id
 }
 
-async fn feed(queue: Arc<Queue>, id: u64, mut requests: Streaming<Bytes>, credits: Arc<Semaphore>) {
+async fn feed(
+    queue: Arc<Queue>,
+    id: u64,
+    mut requests: Streaming<Bytes>,
+    consumed: Arc<Semaphore>,
+) {
+    // Until the call is queued: its messages must not overtake it.
+    let Ok(start) = consumed.acquire().await else {
+        return;
+    };
+    start.forget();
+    // The sizes of the messages Python holds, oldest first (it consumes them in order).
+    let mut held = VecDeque::with_capacity(queue.stream_capacity);
+    let mut held_bytes = 0;
     loop {
-        match credits.acquire().await {
-            Ok(permit) => permit.forget(),
-            Err(_) => return,
+        // At least one message always passes, however large (`max_recv_bytes` bounds it).
+        while held.len() >= queue.stream_capacity || held_bytes >= STREAM_BYTES {
+            let Ok(permit) = consumed.acquire().await else {
+                return;
+            };
+            permit.forget();
+            held_bytes -= held.pop_front().unwrap_or(0);
         }
         let (message, code) = match requests.message().await {
-            Ok(Some(data)) => (Some(data), 0),
+            Ok(Some(data)) => {
+                held.push_back(data.len());
+                held_bytes += data.len();
+                (Some(data), 0)
+            }
             Ok(None) => (None, 0),
             Err(status) if too_large(&status) => (None, Code::ResourceExhausted as i32),
             Err(_) => (None, Code::Cancelled as i32),
@@ -957,7 +984,7 @@ impl Call {
     /// One request message handled: the feeder may read one more.
     fn consumed(&self) {
         if let Some(requests) = &self.requests {
-            requests.credits.add_permits(1);
+            requests.consumed.add_permits(1);
         }
     }
 

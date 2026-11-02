@@ -9,6 +9,9 @@ versions).
 
 ### Fixed
 
+- A request stream's unconsumed messages are bounded in bytes too: its feeder stops
+  reading once Python holds 1 MiB of them (one message always passes). A stream used to
+  hold up to `stream_capacity × max_recv_bytes` (64 MiB with the defaults).
 - A call waiting for an admission permit ends with `DEADLINE_EXCEEDED` at its deadline,
   not tonic's `CANCELLED`.
 - `Server(threads=0)` raises `ValueError` (the tokio runtime used to fail on its thread).
