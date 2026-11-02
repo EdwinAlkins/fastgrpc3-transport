@@ -54,6 +54,11 @@ type UnaryAnswer = Result<tonic::Response<Bytes>, Status>;
 type StreamFuture = BoxFuture<Result<tonic::Response<Responses>, Status>>;
 type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
+/// The bytes of a request stream Python may hold unconsumed before its feeder stops
+/// reading (plus one message): with `stream_capacity`, bounds a stream to
+/// `min(stream_capacity × max_recv_bytes, STREAM_BYTES + max_recv_bytes)`.
+const STREAM_BYTES: usize = 1 << 20;
+
 /// Events after which tokio wakes Python without waiting to sleep first.
 const WAKE_AT: usize = 64;
 
@@ -119,10 +124,12 @@ struct Pending {
     requests: Option<Requests>,
 }
 
-/// The request stream of a call: its feeder task reads one message per credit, so a
+/// The request stream of a call: its feeder task stops reading while Python holds
+/// `stream_capacity` messages or `STREAM_BYTES` of this stream not yet consumed, so a
 /// handler that reads slowly slows the client down (HTTP/2 flow control), not memory.
 struct Requests {
-    credits: Arc<Semaphore>,
+    /// One permit per message consumed by Python (and one when the call is queued).
+    consumed: Arc<Semaphore>,
     feeder: tokio::task::AbortHandle,
 }
 
@@ -219,8 +226,9 @@ fn too_large_response(mut response: http::Response<Body>) -> http::Response<Body
 }
 
 impl Queue {
-    /// A permit for one more RPC, or `RESOURCE_EXHAUSTED`. Never blocks a thread.
-    async fn admit(&self) -> Result<OwnedSemaphorePermit, Status> {
+    /// A permit for one more RPC, or `RESOURCE_EXHAUSTED` (`DEADLINE_EXCEEDED` if the
+    /// call's deadline comes first). Never blocks a thread.
+    async fn admit(&self, deadline: Option<Instant>) -> Result<OwnedSemaphorePermit, Status> {
         let exhausted = || Status::resource_exhausted("too many concurrent calls");
         if let Ok(permit) = self.admission.clone().try_acquire_owned() {
             return Ok(permit);
@@ -228,13 +236,11 @@ impl Queue {
         if self.admission_timeout.is_zero() {
             return Err(exhausted());
         }
-        match tokio::time::timeout(
-            self.admission_timeout,
-            self.admission.clone().acquire_owned(),
-        )
-        .await
-        {
+        let waited = Instant::now() + self.admission_timeout;
+        let until = deadline.map_or(waited, |deadline| deadline.min(waited));
+        match tokio::time::timeout_at(until.into(), self.admission.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
+            _ if until < waited => Err(Status::deadline_exceeded("deadline exceeded")),
             _ => Err(exhausted()),
         }
     }
@@ -367,9 +373,8 @@ fn call_streaming(
     let peer = Peer::of(&request);
     let (metadata, _, requests) = request.into_parts();
     let id = queue.next_id.fetch_add(1, Ordering::Relaxed);
-    // No credit until the call is queued: its messages must not overtake it.
-    let credits = Arc::new(Semaphore::new(0));
-    let feeder = tokio::spawn(feed(queue.clone(), id, requests, credits.clone())).abort_handle();
+    let consumed = Arc::new(Semaphore::new(0));
+    let feeder = tokio::spawn(feed(queue.clone(), id, requests, consumed.clone())).abort_handle();
     queue.push(Event::Call(Pending {
         id,
         path,
@@ -379,22 +384,43 @@ fn call_streaming(
         body: Bytes::new(),
         reply,
         requests: Some(Requests {
-            credits: credits.clone(),
+            consumed: consumed.clone(),
             feeder,
         }),
     }));
-    credits.add_permits(queue.stream_capacity);
+    consumed.add_permits(1); // the feeder's start: its messages must not overtake the call
     id
 }
 
-async fn feed(queue: Arc<Queue>, id: u64, mut requests: Streaming<Bytes>, credits: Arc<Semaphore>) {
+async fn feed(
+    queue: Arc<Queue>,
+    id: u64,
+    mut requests: Streaming<Bytes>,
+    consumed: Arc<Semaphore>,
+) {
+    // Until the call is queued: its messages must not overtake it.
+    let Ok(start) = consumed.acquire().await else {
+        return;
+    };
+    start.forget();
+    // The sizes of the messages Python holds, oldest first (it consumes them in order).
+    let mut held = VecDeque::with_capacity(queue.stream_capacity);
+    let mut held_bytes = 0;
     loop {
-        match credits.acquire().await {
-            Ok(permit) => permit.forget(),
-            Err(_) => return,
+        // At least one message always passes, however large (`max_recv_bytes` bounds it).
+        while held.len() >= queue.stream_capacity || held_bytes >= STREAM_BYTES {
+            let Ok(permit) = consumed.acquire().await else {
+                return;
+            };
+            permit.forget();
+            held_bytes -= held.pop_front().unwrap_or(0);
         }
         let (message, code) = match requests.message().await {
-            Ok(Some(data)) => (Some(data), 0),
+            Ok(Some(data)) => {
+                held.push_back(data.len());
+                held_bytes += data.len();
+                (Some(data), 0)
+            }
             Ok(None) => (None, 0),
             Err(status) if too_large(&status) => (None, Code::ResourceExhausted as i32),
             Err(_) => (None, Code::Cancelled as i32),
@@ -713,7 +739,7 @@ impl tower::Service<http::Request<Body>> for Router {
         match (self.routes.get(&path).copied(), bridge) {
             (Some(kind), Bridge::Queue(queue)) => Box::pin(async move {
                 // Held until the answer (unary, client stream) or by the responses.
-                let permit = match queue.admit().await {
+                let permit = match queue.admit(deadline).await {
                     Ok(permit) => permit,
                     Err(status) => return Ok(status.into_http()),
                 };
@@ -958,7 +984,7 @@ impl Call {
     /// One request message handled: the feeder may read one more.
     fn consumed(&self) {
         if let Some(requests) = &self.requests {
-            requests.credits.add_permits(1);
+            requests.consumed.add_permits(1);
         }
     }
 
@@ -984,14 +1010,19 @@ impl Call {
         let Some(Reply::Stream(sender, _)) = &self.reply else {
             return Ok(CLOSED);
         };
-        Ok(match sender.try_send(Ok(Bytes::copy_from_slice(data))) {
-            Ok(()) => SENT,
-            Err(mpsc::error::TrySendError::Full(_)) => FULL,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.reply = None;
-                CLOSED
+        // Reserve first: a full channel then costs no copy of `data`.
+        let result = match sender.try_reserve() {
+            Ok(permit) => {
+                permit.send(Ok(Bytes::copy_from_slice(data)));
+                SENT
             }
-        })
+            Err(mpsc::error::TrySendError::Full(())) => FULL,
+            Err(mpsc::error::TrySendError::Closed(())) => CLOSED,
+        };
+        if result == CLOSED {
+            self.reply = None;
+        }
+        Ok(result)
     }
 
     /// Ask for this call's id in a later `take()` once its stream has room (or is closed).
@@ -1110,9 +1141,9 @@ impl Server {
         reuse_port: bool,
         tls: Option<TlsFiles>,
     ) -> PyResult<Self> {
-        if stream_capacity == 0 || max_concurrent_rpcs == 0 {
+        if threads == 0 || stream_capacity == 0 || max_concurrent_rpcs == 0 {
             return Err(PyValueError::new_err(
-                "stream_capacity and max_concurrent_rpcs must be at least 1",
+                "threads, stream_capacity and max_concurrent_rpcs must be at least 1",
             ));
         }
         let duration = |seconds: f64, name: &str| {
@@ -1188,6 +1219,12 @@ impl Server {
             "bidi_stream" => Kind::BidiStream,
             other => return Err(PyValueError::new_err(format!("unknown call kind {other}"))),
         };
+        if self.runtime.is_some() {
+            // The routes were copied at start: a later one would be silently ignored.
+            return Err(PyRuntimeError::new_err(
+                "routes must be added before starting",
+            ));
+        }
         self.routes.insert(path, kind);
         Ok(())
     }
@@ -1227,8 +1264,8 @@ impl Server {
             admission_timeout: self.admission_timeout,
             settings: self.settings,
         });
-        self.queue = Some(queue.clone());
-        let bound = self.start(Bridge::Queue(queue), host, port)?;
+        let bound = self.start(Bridge::Queue(queue.clone()), host, port)?;
+        self.queue = Some(queue);
         Ok((bound, python_end))
     }
 
@@ -1358,6 +1395,9 @@ type Taken = (
 
 impl Server {
     fn start(&mut self, bridge: Bridge, host: &str, port: u16) -> PyResult<u16> {
+        if self.runtime.is_some() {
+            return Err(PyRuntimeError::new_err("the server was already started"));
+        }
         let (settings, tls) = (self.settings, self.tls.clone());
         let listener = listen(host, port, settings.reuse_port)?;
         listener.set_nonblocking(true)?;
