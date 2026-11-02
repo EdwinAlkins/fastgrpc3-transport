@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "fastgrpc3-transport"
-version = "0.1.0"
+version = "0.1.1"
 description = "A tonic gRPC server transport for fastgrpc3, with handlers written in Python"
 requires-python = ">=3.12"
 license = "MIT"

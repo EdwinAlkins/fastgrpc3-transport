@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/) (0.x: the API may change between minor
 versions).
 
-## [Unreleased]
+## [0.1.1] - 2026-11-02
 
 ### Fixed
 
@@ -58,4 +58,5 @@ First release: an experimental gRPC server transport for fastgrpc3 on tonic, sel
 - fastgrpc3's codec, protoruf, has no Linux aarch64 wheel yet: installing fastgrpc3 there
   compiles it.
 
+[0.1.1]: https://github.com/EdwinAlkins/fastgrpc3-transport/releases/tag/v0.1.1
 [0.1.0]: https://github.com/EdwinAlkins/fastgrpc3-transport/releases/tag/v0.1.0
