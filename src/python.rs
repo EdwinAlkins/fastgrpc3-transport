@@ -219,8 +219,9 @@ fn too_large_response(mut response: http::Response<Body>) -> http::Response<Body
 }
 
 impl Queue {
-    /// A permit for one more RPC, or `RESOURCE_EXHAUSTED`. Never blocks a thread.
-    async fn admit(&self) -> Result<OwnedSemaphorePermit, Status> {
+    /// A permit for one more RPC, or `RESOURCE_EXHAUSTED` (`DEADLINE_EXCEEDED` if the
+    /// call's deadline comes first). Never blocks a thread.
+    async fn admit(&self, deadline: Option<Instant>) -> Result<OwnedSemaphorePermit, Status> {
         let exhausted = || Status::resource_exhausted("too many concurrent calls");
         if let Ok(permit) = self.admission.clone().try_acquire_owned() {
             return Ok(permit);
@@ -228,13 +229,11 @@ impl Queue {
         if self.admission_timeout.is_zero() {
             return Err(exhausted());
         }
-        match tokio::time::timeout(
-            self.admission_timeout,
-            self.admission.clone().acquire_owned(),
-        )
-        .await
-        {
+        let waited = Instant::now() + self.admission_timeout;
+        let until = deadline.map_or(waited, |deadline| deadline.min(waited));
+        match tokio::time::timeout_at(until.into(), self.admission.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
+            _ if until < waited => Err(Status::deadline_exceeded("deadline exceeded")),
             _ => Err(exhausted()),
         }
     }
@@ -713,7 +712,7 @@ impl tower::Service<http::Request<Body>> for Router {
         match (self.routes.get(&path).copied(), bridge) {
             (Some(kind), Bridge::Queue(queue)) => Box::pin(async move {
                 // Held until the answer (unary, client stream) or by the responses.
-                let permit = match queue.admit().await {
+                let permit = match queue.admit(deadline).await {
                     Ok(permit) => permit,
                     Err(status) => return Ok(status.into_http()),
                 };
@@ -984,14 +983,19 @@ impl Call {
         let Some(Reply::Stream(sender, _)) = &self.reply else {
             return Ok(CLOSED);
         };
-        Ok(match sender.try_send(Ok(Bytes::copy_from_slice(data))) {
-            Ok(()) => SENT,
-            Err(mpsc::error::TrySendError::Full(_)) => FULL,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.reply = None;
-                CLOSED
+        // Reserve first: a full channel then costs no copy of `data`.
+        let result = match sender.try_reserve() {
+            Ok(permit) => {
+                permit.send(Ok(Bytes::copy_from_slice(data)));
+                SENT
             }
-        })
+            Err(mpsc::error::TrySendError::Full(())) => FULL,
+            Err(mpsc::error::TrySendError::Closed(())) => CLOSED,
+        };
+        if result == CLOSED {
+            self.reply = None;
+        }
+        Ok(result)
     }
 
     /// Ask for this call's id in a later `take()` once its stream has room (or is closed).
@@ -1110,9 +1114,9 @@ impl Server {
         reuse_port: bool,
         tls: Option<TlsFiles>,
     ) -> PyResult<Self> {
-        if stream_capacity == 0 || max_concurrent_rpcs == 0 {
+        if threads == 0 || stream_capacity == 0 || max_concurrent_rpcs == 0 {
             return Err(PyValueError::new_err(
-                "stream_capacity and max_concurrent_rpcs must be at least 1",
+                "threads, stream_capacity and max_concurrent_rpcs must be at least 1",
             ));
         }
         let duration = |seconds: f64, name: &str| {
@@ -1188,6 +1192,12 @@ impl Server {
             "bidi_stream" => Kind::BidiStream,
             other => return Err(PyValueError::new_err(format!("unknown call kind {other}"))),
         };
+        if self.runtime.is_some() {
+            // The routes were copied at start: a later one would be silently ignored.
+            return Err(PyRuntimeError::new_err(
+                "routes must be added before starting",
+            ));
+        }
         self.routes.insert(path, kind);
         Ok(())
     }
@@ -1227,8 +1237,8 @@ impl Server {
             admission_timeout: self.admission_timeout,
             settings: self.settings,
         });
-        self.queue = Some(queue.clone());
-        let bound = self.start(Bridge::Queue(queue), host, port)?;
+        let bound = self.start(Bridge::Queue(queue.clone()), host, port)?;
+        self.queue = Some(queue);
         Ok((bound, python_end))
     }
 
@@ -1358,6 +1368,9 @@ type Taken = (
 
 impl Server {
     fn start(&mut self, bridge: Bridge, host: &str, port: u16) -> PyResult<u16> {
+        if self.runtime.is_some() {
+            return Err(PyRuntimeError::new_err("the server was already started"));
+        }
         let (settings, tls) = (self.settings, self.tls.clone());
         let listener = listen(host, port, settings.reuse_port)?;
         listener.set_nonblocking(true)?;

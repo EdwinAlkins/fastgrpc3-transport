@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/) (0.x: the API may change between minor
 versions).
 
+## [Unreleased]
+
+### Fixed
+
+- A call waiting for an admission permit ends with `DEADLINE_EXCEEDED` at its deadline,
+  not tonic's `CANCELLED`.
+- `Server(threads=0)` raises `ValueError` (the tokio runtime used to fail on its thread).
+- Starting a server twice, or adding a route after the start, raises `RuntimeError`
+  instead of being silently ignored or replacing the running server.
+- `Call.try_send` no longer copies the message when the stream is full.
+
 ## [0.1.0] - 2026-10-30
 
 First release: an experimental gRPC server transport for fastgrpc3 on tonic, selected with

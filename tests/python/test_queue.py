@@ -246,6 +246,18 @@ async def test_a_call_may_wait_for_a_permit() -> None:
         assert (await held, await waiting) == (b"held", b"ok")
 
 
+async def test_a_wait_for_a_permit_is_bounded_by_the_deadline() -> None:
+    handlers, release, started = holding()
+    async with serving(handlers, max_concurrent_rpcs=1, admission_timeout=5.0) as (channel, _):
+        held = asyncio.ensure_future(channel.unary_unary("/s.S/Hold")(b""))
+        await until(lambda: len(started) == 1)
+        with pytest.raises(grpc.aio.AioRpcError) as raised:
+            await channel.unary_unary("/s.S/Get")(b"", timeout=0.3)
+        assert raised.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+        release.set()
+        await held
+
+
 async def test_a_stream_holds_its_permit_until_it_ends() -> None:
     box: list[Bridge] = []
     produced = [0]
@@ -357,3 +369,18 @@ async def test_an_idle_connection_does_not_delay_the_stop() -> None:
         with pytest.raises(grpc.aio.AioRpcError) as raised:
             await channel.unary_unary("/s.S/Get")(b"", timeout=2)
     assert raised.value.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+
+
+def test_misuse_is_refused() -> None:
+    with pytest.raises(ValueError):
+        Server(threads=0)
+    server = Server(threads=1)
+    server.start_queue(0)
+    try:
+        with pytest.raises(RuntimeError):
+            server.start_queue(0)
+        with pytest.raises(RuntimeError):
+            server.add_route("/s.S/Late", "unary")
+    finally:
+        server.stop()
+
